@@ -3,6 +3,8 @@ package descriptor
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/h3yow/oci-image-pipeline-go/internal/digest"
 )
@@ -40,19 +42,68 @@ type Platform struct {
 	Variant string `json:"variant,omitempty"`
 }
 
-// String 返回 platform 的稳定字符串形式 os/arch[/variant]。
-func (p Platform) String() string { return "" }
+// String 返回平台的稳定字符串形式 os/arch[/variant]。
+// 字段统一转为小写，保证 "linux/AMD64" 与 "linux/amd64" 结论一致。
+func (p Platform) String() string {
+	var b strings.Builder
+	b.WriteString(strings.ToLower(p.OS))
+	b.WriteByte('/')
+	b.WriteString(strings.ToLower(p.Architecture))
+	if v := strings.ToLower(p.Variant); v != "" {
+		b.WriteByte('/')
+		b.WriteString(v)
+	}
+	return b.String()
+}
 
-// Match 判定目标平台是否与当前选择条件相等。
-// variant 为空表示"不约束"：条件方 variant 为空时匹配任意变体。
-func (p Platform) Match(target Platform) bool { return false }
+// Normalize 返回字段归一化为小写且去除首尾空白后的平台副本。
+func (p Platform) Normalize() Platform {
+	return Platform{
+		OS:           strings.ToLower(strings.TrimSpace(p.OS)),
+		Architecture: strings.ToLower(strings.TrimSpace(p.Architecture)),
+		Variant:      strings.ToLower(strings.TrimSpace(p.Variant)),
+	}
+}
+
+// Match 判定 target 是否满足当前选择条件 p：
+//   - os、architecture 必须完全相等（小写归一化后）；
+//   - p.Variant 为空表示"不约束变体"，target 任意变体均满足；
+//     p.Variant 非空时，target.Variant 必须与其相等；
+//   - target 自身 Variant 为空而 p 要求非空时不匹配。
+func (p Platform) Match(target Platform) bool {
+	c := p.Normalize()
+	t := target.Normalize()
+	if c.OS == "" || c.Architecture == "" {
+		return false
+	}
+	if c.OS != t.OS || c.Architecture != t.Architecture {
+		return false
+	}
+	if c.Variant != "" && c.Variant != t.Variant {
+		return false
+	}
+	return true
+}
 
 var (
 	// ErrEmptyDigest 表示描述符缺少摘要。
 	ErrEmptyDigest = errors.New("descriptor: digest is empty")
 	// ErrInvalidSize 表示描述符大小为负。
 	ErrInvalidSize = errors.New("descriptor: size is negative")
+	// ErrEmptyMediaType 表示描述符缺少 mediaType。
+	ErrEmptyMediaType = errors.New("descriptor: mediaType is empty")
 )
 
-// Validate 校验描述符自身字段的完整性。
-func (d Descriptor) Validate() error { return nil }
+// Validate 校验描述符自身字段的完整性（不触碰存储内容）。
+func (d Descriptor) Validate() error {
+	if d.MediaType == "" {
+		return ErrEmptyMediaType
+	}
+	if d.Digest.IsZero() {
+		return fmt.Errorf("%w (mediaType=%s)", ErrEmptyDigest, d.MediaType)
+	}
+	if d.Size < 0 {
+		return fmt.Errorf("%w: %d (digest=%s)", ErrInvalidSize, d.Size, d.Digest)
+	}
+	return nil
+}
