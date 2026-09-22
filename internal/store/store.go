@@ -31,6 +31,11 @@ type Store struct {
 	root string
 
 	mu sync.RWMutex
+
+	// publishMu 协调"发布新引用"与"垃圾回收"：
+	// 发布临界区（层+配置+清单+标签整体可见）持 RLock，可彼此并行；
+	// GC 清除阶段持 Lock，与任何发布互斥。纯读取不参与该锁，不影响并发读。
+	publishMu sync.RWMutex
 }
 
 // 可区分的错误原因。
@@ -63,6 +68,20 @@ func Open(root string) (*Store, error) {
 
 // Root 返回存储根目录。
 func (s *Store) Root() string { return s.root }
+
+// PublishLock 返回发布侧读锁：调用方在"写入新对象到标签对他人可见"的
+// 整个临界区持有它，防止 GC 在发布中途把尚未被标签引用的层误判为垃圾。
+// 多个发布临界区可并行；必须与 PublishUnlock 配对。
+func (s *Store) PublishLock() { s.publishMu.RLock() }
+
+// PublishUnlock 释放发布侧读锁。
+func (s *Store) PublishUnlock() { s.publishMu.RUnlock() }
+
+// GCLock 获取 GC 清除阶段的排他锁：与所有发布临界区互斥。
+func (s *Store) GCLock() { s.publishMu.Lock() }
+
+// GCUnlock 释放 GC 排他锁。
+func (s *Store) GCUnlock() { s.publishMu.Unlock() }
 
 func (s *Store) blobDir() string { return filepath.Join(s.root, "blobs", "sha256") }
 func (s *Store) tmpDir() string  { return filepath.Join(s.root, "tmp") }

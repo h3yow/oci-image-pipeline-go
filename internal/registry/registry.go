@@ -158,7 +158,17 @@ func (r *Registry) tagPath(ref Ref) string {
 // PushManifest 将标签指向清单描述符。
 // desc.MediaType 为旧版 v0 时拒绝写入（ErrLegacyRejected）；
 // 非清单 mediaType 一律拒绝，防止标识混用。
+//
+// 调用方若需要"写入对象 + 打标签"整体对 GC 原子，应使用 Publish；
+// 单独 PushManifest 自身也在发布临界区内执行校验与记录落盘。
 func (r *Registry) PushManifest(ctx context.Context, ref Ref, desc descriptor.Descriptor) error {
+	r.st.PublishLock()
+	defer r.st.PublishUnlock()
+	return r.PushManifestLocked(ctx, ref, desc)
+}
+
+// PushManifestLocked 假定调用方已持有发布锁。
+func (r *Registry) PushManifestLocked(ctx context.Context, ref Ref, desc descriptor.Descriptor) error {
 	if desc.MediaType == descriptor.MediaTypeLegacyManifest {
 		return fmt.Errorf("%w: digest=%s", ErrLegacyRejected, desc.Digest)
 	}
@@ -177,6 +187,13 @@ func (r *Registry) PushManifest(ctx context.Context, ref Ref, desc descriptor.De
 
 // PushIndex 将标签指向索引描述符。
 func (r *Registry) PushIndex(ctx context.Context, ref Ref, desc descriptor.Descriptor) error {
+	r.st.PublishLock()
+	defer r.st.PublishUnlock()
+	return r.PushIndexLocked(ctx, ref, desc)
+}
+
+// PushIndexLocked 假定调用方已持有发布锁。
+func (r *Registry) PushIndexLocked(ctx context.Context, ref Ref, desc descriptor.Descriptor) error {
 	if desc.MediaType != descriptor.MediaTypeImageIndex {
 		return fmt.Errorf("%w: push index with mediaType=%q", ErrKindMismatch, desc.MediaType)
 	}
@@ -447,6 +464,11 @@ func (r *Registry) AllRecords(ctx context.Context) ([]TagRecord, error) {
 		}
 		rec, rerr := r.readRecord(ref)
 		if rerr != nil {
+			// 枚举期间标签被并发删除：跳过该消失的根（等价于它从未参与
+			// 本次标记）。注意：半写入不会走到这里，标签写入是原子 rename。
+			if errors.Is(rerr, ErrUnknownTag) {
+				return nil
+			}
 			return rerr
 		}
 		recs = append(recs, *rec)

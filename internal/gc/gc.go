@@ -60,8 +60,12 @@ func New(st *store.Store, reg *registry.Registry) *Collector {
 	return &Collector{st: st, reg: reg}
 }
 
-// Run 执行一次标记-清除。
+// Run 执行一次标记-清除。整个标记+清除期间持有 CAS 发布排他锁，
+// 保证不会出现"新标签引用了刚被判为垃圾的层"的交错。
 func (c *Collector) Run(ctx context.Context) (*Report, error) {
+	c.st.GCLock()
+	defer c.st.GCUnlock()
+
 	reachable, err := c.Mark(ctx)
 	if err != nil {
 		return nil, err

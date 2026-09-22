@@ -16,24 +16,28 @@ import (
 // 每个清单描述符必须真实存在且通过完整性校验；条目顺序不影响索引摘要
 // （编码时按平台键稳定排序发生在 SelectPlatform 之外，此处显式排序输入）。
 func (r *Registry) BuildAndPushIndex(ctx context.Context, ref Ref, entries []manifest.IndexEntry) (descriptor.Descriptor, error) {
-	idx := &manifest.Index{Manifests: entries}
-	raw, err := manifest.EncodeIndex(idx)
+	var result descriptor.Descriptor
+	err := r.PushIndexPublish(ctx, ref, func() (descriptor.Descriptor, error) {
+		idx := &manifest.Index{Manifests: entries}
+		raw, err := manifest.EncodeIndex(idx)
+		if err != nil {
+			return descriptor.Descriptor{}, err
+		}
+		dgst, size, err := r.store().Put(ctx, bytes.NewReader(raw))
+		if err != nil {
+			return descriptor.Descriptor{}, fmt.Errorf("registry: put index: %w", err)
+		}
+		result = descriptor.Descriptor{
+			MediaType: descriptor.MediaTypeImageIndex,
+			Digest:    dgst,
+			Size:      size,
+		}
+		return result, nil
+	})
 	if err != nil {
 		return descriptor.Descriptor{}, err
 	}
-	dgst, size, err := r.store().Put(ctx, bytes.NewReader(raw))
-	if err != nil {
-		return descriptor.Descriptor{}, fmt.Errorf("registry: put index: %w", err)
-	}
-	desc := descriptor.Descriptor{
-		MediaType: descriptor.MediaTypeImageIndex,
-		Digest:    dgst,
-		Size:      size,
-	}
-	if err := r.PushIndex(ctx, ref, desc); err != nil {
-		return descriptor.Descriptor{}, err
-	}
-	return desc, nil
+	return result, nil
 }
 
 // LoadManifestDescriptor 从 CAS 读取 desc 对应清单（供命令侧组装索引前校验）。

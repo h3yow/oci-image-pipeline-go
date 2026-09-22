@@ -79,15 +79,19 @@ func runBuild(args []string) error {
 	a := assembler.New(st, func() time.Time {
 		return fixedClock
 	})
-	res, err := a.Assemble(ctx, *contextDir, assembler.Options{
-		Architecture: *goarch,
-		OS:           *goos,
-		Created:      created,
-	})
-	if err != nil {
-		return err
-	}
-	if err := reg.PushManifest(ctx, ref, res.ManifestDescriptor); err != nil {
+	var res *assembler.Result
+	if err := reg.Publish(ctx, ref, func() (descriptor.Descriptor, error) {
+		r, aerr := a.Assemble(ctx, *contextDir, assembler.Options{
+			Architecture: *goarch,
+			OS:           *goos,
+			Created:      created,
+		})
+		if aerr != nil {
+			return descriptor.Descriptor{}, aerr
+		}
+		res = r
+		return r.ManifestDescriptor, nil
+	}); err != nil {
 		return err
 	}
 	fmt.Printf("context: %s\n", *contextDir)
