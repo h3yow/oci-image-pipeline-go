@@ -147,6 +147,9 @@ func Open(dir string, st *store.Store) (*Registry, error) {
 	return &Registry{dir: dir, st: st}, nil
 }
 
+// Dir 返回仓库目录。
+func (r *Registry) Dir() string { return r.dir }
+
 func (r *Registry) tagPath(ref Ref) string {
 	// name 段已由 ParseRef 校验，仅含安全字符，可直接作为路径。
 	return filepath.Join(r.dir, "tags", filepath.FromSlash(ref.Name), ref.Tag+".json")

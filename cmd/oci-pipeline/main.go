@@ -4,13 +4,15 @@
 //
 //	oci-pipeline init  --root DIR
 //	    初始化本地 CAS 与仓库目录。
-//	oci-pipeline build --root DIR --context DIR --name NAME:TAG [--os linux] [--arch amd64]
-//	    组装镜像并打标签。
-//	oci-pipeline push  --root DIR --name NAME:TAG --index DIGEST
-//	    将已存在的索引（按摘要）绑到标签（多架构场景）。
-//	oci-pipeline resolve --root DIR --name NAME:TAG [--os linux --arch amd64 [--variant V]]
-//	    解析引用；给出平台时执行唯一平台选择。
-//	oci-pipeline gc    --root DIR
+//	oci-pipeline build --root DIR --context DIR --name NAME:TAG [--os linux]
+//	    [--arch amd64] [--at RFC3339]
+//	    组装镜像并打标签；输出层/配置/镜像摘要与去重情况。
+//	oci-pipeline push-index --root DIR --name NAME:TAG --digest sha256:...
+//	    将已存在的索引对象（按摘要）绑到标签。
+//	oci-pipeline resolve --root DIR --name NAME:TAG [--os linux --arch amd64
+//	    [--variant v7]] [--digest]
+//	    解析引用；给出平台时执行唯一平台选择，输出所选清单摘要。
+//	oci-pipeline gc --root DIR [--verbose]
 //	    标记-清除无引用对象并打印报告。
 package main
 
@@ -20,32 +22,35 @@ import (
 	"os"
 )
 
-// 全局标志（各子命令共用）。
-var rootDir string
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
-	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
-	fs.StringVar(&rootDir, "root", "./.ociwork", "本地工作根目录（CAS+仓库）")
-	_ = fs.Parse(os.Args[2:])
+	args := os.Args[2:]
 
-	var err error
+	var (
+		err error
+	)
 	switch cmd {
 	case "init":
-		err = cmdInit(fs.Args())
+		err = runInit(args)
 	case "build":
-		err = cmdBuild(fs.Args())
+		err = runBuild(args)
 	case "push-index":
-		err = cmdPushIndex(fs.Args())
+		err = runPushIndex(args)
+	case "index":
+		err = runIndex(args)
 	case "resolve":
-		err = cmdResolve(fs.Args())
+		err = runResolve(args)
 	case "gc":
-		err = cmdGC(fs.Args())
+		err = runGC(args)
+	case "-h", "--help", "help":
+		usage()
+		return
 	default:
+		fmt.Fprintf(os.Stderr, "unknown subcommand: %s\n", cmd)
 		usage()
 		os.Exit(2)
 	}
@@ -56,11 +61,10 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: oci-pipeline <init|build|push-index|resolve|gc> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: oci-pipeline <init|build|index|push-index|resolve|gc> [flags]")
 }
 
-func cmdInit(args []string) error  { return nil }
-func cmdBuild(args []string) error { return nil }
-func cmdPushIndex(args []string) error { return nil }
-func cmdResolve(args []string) error { return nil }
-func cmdGC(args []string) error  { return nil }
+// rootFlag 注册各子命令共用的 --root。
+func rootFlag(fs *flag.FlagSet) *string {
+	return fs.String("root", "./.ociwork", "本地工作根目录（CAS+仓库）")
+}
