@@ -150,15 +150,11 @@ func (c *Collector) markSeen(dgst digest.Digest, reach map[digest.Digest]struct{
 
 // readBlob 读取并完整校验一个对象，返回其字节；任何损坏都作为错误上抛。
 func (c *Collector) readBlob(ctx context.Context, desc descriptor.Descriptor) ([]byte, error) {
-	rc, size, err := c.st.Get(ctx, desc.Digest)
+	rc, _, err := c.st.OpenExpected(ctx, desc.Digest, desc.Size)
 	if err != nil {
 		return nil, fmt.Errorf("gc: open %s: %w", desc.Digest, err)
 	}
 	defer rc.Close()
-	if size != desc.Size {
-		return nil, fmt.Errorf("gc: %w: %s descriptor=%d stored=%d",
-			store.ErrSizeMismatch, desc.Digest, desc.Size, size)
-	}
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, rc); err != nil {
 		return nil, fmt.Errorf("gc: verify %s: %w", desc.Digest, err)

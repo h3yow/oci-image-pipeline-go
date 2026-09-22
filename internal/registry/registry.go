@@ -191,15 +191,12 @@ func (r *Registry) PushIndex(ctx context.Context, ref Ref, desc descriptor.Descr
 
 // checkObject 从 CAS 读取对象：存在性、大小、摘要在此一次性区分校验。
 func (r *Registry) checkObject(ctx context.Context, desc descriptor.Descriptor) error {
-	rc, size, err := r.st.Get(ctx, desc.Digest)
+	// 按描述符声明大小打开：截断在打开时即被识别为 ErrSizeMismatch。
+	rc, _, err := r.st.OpenExpected(ctx, desc.Digest, desc.Size)
 	if err != nil {
 		return err // ErrNotFound / ErrDigestMismatch / ErrSizeMismatch 原样透出
 	}
 	defer rc.Close()
-	if size != desc.Size {
-		return fmt.Errorf("%w: descriptor size %d != stored size %d",
-			store.ErrSizeMismatch, desc.Size, size)
-	}
 	buf := new(bytes.Buffer)
 	if _, err := buf.ReadFrom(rc); err != nil {
 		return err
@@ -290,15 +287,11 @@ func (r *Registry) PullManifest(ctx context.Context, ref Ref) (*manifest.Manifes
 }
 
 func (r *Registry) loadManifest(ctx context.Context, desc descriptor.Descriptor) (*manifest.Manifest, error) {
-	rc, size, err := r.st.Get(ctx, desc.Digest)
+	rc, _, err := r.st.OpenExpected(ctx, desc.Digest, desc.Size)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	if size != desc.Size {
-		return nil, fmt.Errorf("%w: descriptor=%d stored=%d",
-			store.ErrSizeMismatch, desc.Size, size)
-	}
 	raw := new(bytes.Buffer)
 	if _, err := raw.ReadFrom(rc); err != nil {
 		return nil, err
@@ -325,15 +318,11 @@ func (r *Registry) PullIndex(ctx context.Context, ref Ref) (*manifest.Index, *Ta
 		return nil, rec, fmt.Errorf("%w: %s is %s, want index",
 			ErrKindMismatch, ref, rec.Kind)
 	}
-	rc, size, err := r.st.Get(ctx, rec.Descriptor.Digest)
+	rc, _, err := r.st.OpenExpected(ctx, rec.Descriptor.Digest, rec.Descriptor.Size)
 	if err != nil {
 		return nil, rec, err
 	}
 	defer rc.Close()
-	if size != rec.Descriptor.Size {
-		return nil, rec, fmt.Errorf("%w: descriptor=%d stored=%d",
-			store.ErrSizeMismatch, rec.Descriptor.Size, size)
-	}
 	raw := new(bytes.Buffer)
 	if _, err := raw.ReadFrom(rc); err != nil {
 		return nil, rec, err
@@ -402,15 +391,11 @@ func (r *Registry) loadConfig(ctx context.Context, m *manifest.Manifest) (*manif
 	if m.Config == nil {
 		return nil, fmt.Errorf("%w: manifest without config", manifest.ErrMissingField)
 	}
-	rc, size, err := r.st.Get(ctx, m.Config.Digest)
+	rc, _, err := r.st.OpenExpected(ctx, m.Config.Digest, m.Config.Size)
 	if err != nil {
 		return nil, err
 	}
 	defer rc.Close()
-	if size != m.Config.Size {
-		return nil, fmt.Errorf("%w: config descriptor=%d stored=%d",
-			store.ErrSizeMismatch, m.Config.Size, size)
-	}
 	raw := new(bytes.Buffer)
 	if _, err := raw.ReadFrom(rc); err != nil {
 		return nil, err

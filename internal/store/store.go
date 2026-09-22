@@ -155,10 +155,22 @@ func (s *Store) Put(ctx context.Context, r io.Reader) (digest.Digest, int64, err
 	return dgst, n, nil
 }
 
-// Get 打开 dgst 对应对象供读取。返回的 ReadCloser 在读取全程做摘要校验，
-// 并且要求读取到声明的完整大小；Read 到 EOF 时自动完成校验，Close 幂等。
-// 内容损坏时 Read 返回 ErrDigestMismatch，截断返回 ErrSizeMismatch。
+// Get 打开 dgst 对应对象供读取，期望大小以磁盘 stat 为准（适用于调用方
+// 没有描述符、仅按摘要读取的场景）。需要按"描述符声明大小"区分截断时，
+// 使用 OpenExpected。
 func (s *Store) Get(ctx context.Context, dgst digest.Digest) (io.ReadCloser, int64, error) {
+	return s.OpenExpected(ctx, dgst, -1)
+}
+
+// OpenExpected 打开 dgst 对象，并以 declaredSize 作为完整性判据之一：
+//   - declaredSize >= 0：磁盘实际大小与之不符（截断/追加）立即返回
+//     ErrSizeMismatch；读取结束时若字节数不足同样为 ErrSizeMismatch；
+//   - declaredSize < 0：以磁盘 stat 大小为期望大小；
+//   - 读取全程计算 sha256，EOF 时与 dgst 不符返回 ErrDigestMismatch；
+//   - 对象不存在返回 ErrNotFound。
+//
+// 三类失败严格区分：截断绝不会被误报为摘要不符，损坏绝不会被当作未命中。
+func (s *Store) OpenExpected(ctx context.Context, dgst digest.Digest, declaredSize int64) (io.ReadCloser, int64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -175,6 +187,11 @@ func (s *Store) Get(ctx context.Context, dgst digest.Digest) (io.ReadCloser, int
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, 0, fmt.Errorf("%w: not a regular file: %s", ErrNotFound, dgst)
+	}
+	if declaredSize >= 0 && fi.Size() != declaredSize {
+		return nil, fi.Size(), fmt.Errorf(
+			"%w: object %s declared %d bytes but stored %d bytes",
+			ErrSizeMismatch, dgst, declaredSize, fi.Size())
 	}
 	f, err := os.Open(final)
 	if err != nil {

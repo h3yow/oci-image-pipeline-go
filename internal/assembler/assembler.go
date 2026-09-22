@@ -170,7 +170,7 @@ func (a *Assembler) Assemble(ctx context.Context, contextDir string, opts Option
 
 // verifyRoundTrip 回读对象并比对字节，确保存储没有半写入/错位。
 func (a *Assembler) verifyRoundTrip(ctx context.Context, dgst digest.Digest, want []byte) error {
-	rc, size, err := a.st.Get(ctx, dgst)
+	rc, _, err := a.st.OpenExpected(ctx, dgst, int64(len(want)))
 	if err != nil {
 		return fmt.Errorf("assembler: verify open %s: %w", dgst, err)
 	}
@@ -179,7 +179,7 @@ func (a *Assembler) verifyRoundTrip(ctx context.Context, dgst digest.Digest, wan
 	if _, err := got.ReadFrom(rc); err != nil {
 		return fmt.Errorf("assembler: verify read %s: %w", dgst, err)
 	}
-	if size != int64(len(want)) || !bytes.Equal(got.Bytes(), want) {
+	if !bytes.Equal(got.Bytes(), want) {
 		return fmt.Errorf("assembler: verify %s: content differs after write", dgst)
 	}
 	return nil
