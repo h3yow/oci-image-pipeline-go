@@ -111,10 +111,10 @@ func TestUnsupportedFormatsRejected(t *testing.T) {
 	cfg := mustDesc(t, descriptor.MediaTypeImageConfig, "c")
 
 	cases := []struct {
-		name      string
-		media     descriptor.MediaType
-		raw       string
-		want      error
+		name  string
+		media descriptor.MediaType
+		raw   string
+		want  error
 	}{
 		{"unknown version", descriptor.MediaTypeImageManifest,
 			`{"manifestVersion":9,"config":null,"layers":[]}`, ErrUnsupportedFormat},

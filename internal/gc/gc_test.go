@@ -312,7 +312,10 @@ func TestIndexClosageMarked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []struct{ name string; d interface{ String() string } }{
+	for _, want := range []struct {
+		name string
+		d    interface{ String() string }
+	}{
 		{"index", idxDesc.Digest}, {"amd manifest", amd.Digest}, {"arm manifest", arm.Digest},
 	} {
 		if _, ok := rep.Reachable[toDigest(want.d)]; !ok {

@@ -160,11 +160,11 @@ func (a *Assembler) Assemble(ctx context.Context, contextDir string, opts Option
 	}
 
 	return &Result{
-		Manifest:          *m,
+		Manifest:           *m,
 		ManifestDescriptor: manDesc,
-		ConfigDescriptor:  cfgDesc,
-		LayerDescriptors:  []descriptor.Descriptor{layerDesc},
-		NewLayerBytes:     newBytes,
+		ConfigDescriptor:   cfgDesc,
+		LayerDescriptors:   []descriptor.Descriptor{layerDesc},
+		NewLayerBytes:      newBytes,
 	}, nil
 }
 

@@ -207,7 +207,6 @@ func TestConcurrentAssembleAndGC(t *testing.T) {
 	errCh := make(chan error, workers*iterations+iterations)
 	a := assembler.New(e.st, func() time.Time { return clock })
 
-
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {

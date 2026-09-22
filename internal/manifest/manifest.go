@@ -52,9 +52,9 @@ type Layer struct {
 
 // Manifest 为与版本无关的内存表示。
 type Manifest struct {
-	Version   Version
-	Config    *descriptor.Descriptor // v1 必填；v0 可能为 nil（缺省语义）
-	Layers    []descriptor.Descriptor
+	Version     Version
+	Config      *descriptor.Descriptor // v1 必填；v0 可能为 nil（缺省语义）
+	Layers      []descriptor.Descriptor
 	Annotations map[string]string
 	// raw 保留原始 JSON 的有序键值，用于稳定往返与摘要复算。
 	raw orderedObject
@@ -212,18 +212,18 @@ func DecodeConfig(raw []byte) (*ImageConfig, error) {
 
 // wireManifestV1 为 v1 清单的线上结构。
 type wireManifestV1 struct {
-	MediaType   descriptor.MediaType   `json:"mediaType"`
-	Version     int                    `json:"manifestVersion"`
-	Config      *descriptor.Descriptor `json:"config,omitempty"`
+	MediaType   descriptor.MediaType    `json:"mediaType"`
+	Version     int                     `json:"manifestVersion"`
+	Config      *descriptor.Descriptor  `json:"config,omitempty"`
 	Layers      []descriptor.Descriptor `json:"layers"`
-	Annotations map[string]string      `json:"annotations,omitempty"`
+	Annotations map[string]string       `json:"annotations,omitempty"`
 }
 
 // wireManifestV0 为旧版清单：无 config、无 mediaType 时按旧 mediaType 处理。
 type wireManifestV0 struct {
-	Version     int                    `json:"manifestVersion"`
+	Version     int                     `json:"manifestVersion"`
 	Layers      []descriptor.Descriptor `json:"layers"`
-	Annotations map[string]string      `json:"annotations,omitempty"`
+	Annotations map[string]string       `json:"annotations,omitempty"`
 }
 
 // EncodeV1 将内存清单规范化编码为 v1 JSON。拒绝 Version0（旧格式不可再写）。
@@ -553,6 +553,3 @@ func DescriptorFor(mediaType descriptor.MediaType, raw []byte) descriptor.Descri
 		Size:      int64(len(raw)),
 	}
 }
-
-// 占位：保证 time 包在所有构建配置下均被使用（Created 字段已使用，保留无碍）。
-var _ = time.Time{}
