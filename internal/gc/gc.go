@@ -56,6 +56,12 @@ type Result struct {
 func (c *Collector) Run(ctx context.Context) (*Result, error) {
 	res := &Result{}
 
+	// 整轮回收与“引用发布（提交）”互斥：本轮期间不会有新引用发布到
+	// 回收中途看到的对象集上，提交动作也不会在闭包校验与发布之间被
+	// 回收穿插。由此杜绝“新引用指向刚被删除的对象”。
+	c.registry.BeginGC()
+	defer c.registry.EndGC()
+
 	// 1) 引用可达闭包。
 	refs, err := c.registry.AllRefs(ctx)
 	if err != nil {

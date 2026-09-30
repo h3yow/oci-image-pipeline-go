@@ -82,7 +82,7 @@ func (a *Assembler) AssembleImage(ctx context.Context, spec ImageSpec) (manifest
 		ld := digest.FromBytes(tarBytes)
 		inputDigest := digest.FromBytes(flattenInput(layer.Files))
 
-		existed, err := a.store.Exists(ctx, ld)
+		existed, err := a.store.Has(ld)
 		if err != nil {
 			return manifest.Descriptor{}, nil, err
 		}

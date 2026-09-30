@@ -101,14 +101,21 @@ func TestMissingVsCorruptAreDistinct(t *testing.T) {
 		t.Fatalf("篡改必须归类 ErrCorrupt（而非 ErrNotFound），got %v", err)
 	}
 
-	// 损坏对象可用正确内容原子修复。
+	// 损坏对象不会被 Put 静默覆盖（防止掩盖被引用对象的完整性问题）。
+	if err := store.Put(ctx, d, bytes.NewReader(data)); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("损坏同名对象 Put 必须报 ErrCorrupt 而非静默覆盖，got %v", err)
+	}
+	// 修复路径：先显式删除损坏对象，再以正确内容写入。
+	if err := store.Delete(ctx, d); err != nil {
+		t.Fatalf("删除损坏对象失败: %v", err)
+	}
 	if err := store.Put(ctx, d, bytes.NewReader(data)); err != nil {
-		t.Fatalf("以正确内容修复损坏对象失败: %v", err)
+		t.Fatalf("以正确内容重新写入失败: %v", err)
 	}
 	if _, err := store.GetBytes(ctx, d); err != nil {
 		t.Fatalf("修复后读取失败: %v", err)
 	}
-	t.Log("判定: 损坏对象被正确内容原子替换后恢复完整")
+	t.Log("判定: 损坏对象不被静默覆盖；先删除后重写即恢复完整")
 }
 
 func TestConcurrentPutSameDigest(t *testing.T) {

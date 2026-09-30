@@ -54,7 +54,22 @@ type Registry struct {
 	root  string
 	store *cas.Store
 	mu    sync.Mutex // 串行化同一进程内对引用的读改写（如 AttachPlatform）
+	// gcMu 协调“引用发布（提交）”与“整轮回收”：
+	//   - 一次提交（BeginCommit）在“组装对象 -> 校验目标闭包 -> 原子
+	//     发布引用”的整段区间内持有读锁（同时持 mu 串行化引用变更）；
+	//   - gc.Run 持写锁，因此提交与回收互不穿插。
+	// 这消除了“对象已写完但引用尚未发布”窗口里对象被回收、
+	// 从而让新引用指向缺失对象的可能。纯读取（Resolve/Select/...）
+	// 不需要这两把锁，因为对象一经引用即受可达闭包长期保护。
+	gcMu sync.RWMutex
 }
+
+// BeginGC / EndGC 由回收器在一轮回收前后成对调用：回收期间任何引用发布
+// （提交）都会等待本轮结束，提交期间回收也不会开始。
+func (r *Registry) BeginGC() { r.gcMu.Lock() }
+
+// EndGC 结束一轮回收的互斥区间。
+func (r *Registry) EndGC() { r.gcMu.Unlock() }
 
 // New 打开 root 下的本地仓库。
 func New(store *cas.Store) (*Registry, error) {
@@ -173,8 +188,44 @@ func (r *Registry) Resolve(_ context.Context, ref string) (manifest.Descriptor, 
 	return rec.Target, nil
 }
 
-// Tag 将引用原子指向 desc。desc 须通过描述符校验。
-func (r *Registry) Tag(_ context.Context, ref string, desc manifest.Descriptor) error {
+// Tag 将引用原子指向 desc。
+//
+// 这是一次“提交”：desc 的整棵闭包（清单/config/层，或索引下全部平台）
+// 必须先通过统一完整性校验（VerifyClosure），随后才原子替换引用文件。
+// 校验与发布在提交门（BeginCommit：互斥引用变更、且与 gc.Run 互斥）
+// 保护下完成；任一步失败则引用保持原状，外部绝不会读到指向缺失/损坏
+// 对象的引用。
+func (r *Registry) Tag(ctx context.Context, ref string, desc manifest.Descriptor) error {
+	release := r.BeginCommit()
+	defer release()
+	return r.tagTxn(ctx, ref, desc)
+}
+
+// BeginCommit 进入一次提交区间并返回释放函数：
+//   - 与 gc.Run 整轮互斥（gcMu.RLock vs gcMu.Lock）；
+//   - 串行化同一进程内的引用变更（mu），避免并发提交互相穿插。
+//
+// 需要在“组装对象”之前就进入提交区间的高层编排（commit.Committer）
+// 使用它，以消除“对象已写完但引用尚未发布”窗口内被回收的可能。
+// 返回的 release 必须且只能调用一次。
+func (r *Registry) BeginCommit() (release func()) {
+	r.mu.Lock()
+	r.gcMu.RLock()
+	return func() {
+		r.gcMu.RUnlock()
+		r.mu.Unlock()
+	}
+}
+
+// TagInCommit 在调用方已通过 BeginCommit 持有的提交区间内执行 Tag。
+// 适用于“先组装、后发布”的单次原子提交编排。
+func (r *Registry) TagInCommit(ctx context.Context, ref string, desc manifest.Descriptor) error {
+	return r.tagTxn(ctx, ref, desc)
+}
+
+// tagTxn 执行“校验闭包 -> 原子发布引用”；调用方必须已进入提交区间
+// （Tag 自取，或经 BeginCommit + TagInCommit）。
+func (r *Registry) tagTxn(ctx context.Context, ref string, desc manifest.Descriptor) error {
 	if err := desc.Validate(true); err != nil {
 		return err
 	}
@@ -187,12 +238,17 @@ func (r *Registry) Tag(_ context.Context, ref string, desc manifest.Descriptor) 
 		return err
 	}
 	doc = append(doc, '\n')
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if err := r.VerifyClosure(ctx, desc); err != nil {
+		return fmt.Errorf("commit %s: %w", ref, err)
+	}
 	return r.atomicWriteRef(p, doc)
 }
 
-// attachLocked 在持锁条件下把平台清单并入引用目标索引。
+// attachLocked 在已进入提交区间的条件下把平台清单并入引用目标索引。
+//
+// 新索引对象写入 CAS 后、原子替换引用前，必须通过 VerifyClosure 整闭包
+// 校验。因此一次 AttachPlatform 与 Tag 一样具备提交原子性：成功则引用
+// 指向一棵从头到尾完整的对象树，失败则引用保持追加前的旧索引不变。
 func (r *Registry) attachLocked(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
 	if err := m.Validate(true); err != nil {
 		return err
@@ -252,14 +308,25 @@ func (r *Registry) attachLocked(ctx context.Context, ref string, m manifest.Desc
 	if err != nil {
 		return err
 	}
+	// 提交闸门：新索引整闭包（含全部既有平台与新平台）完整后才发布。
+	if err := r.VerifyClosure(ctx, desc); err != nil {
+		return fmt.Errorf("commit %s: %w", ref, err)
+	}
 	return r.atomicWriteRef(p2, append(doc, '\n'))
 }
 
 // AttachPlatform 将一个平台清单挂到 ref 指向的索引下；
 // ref 尚不存在时创建索引。平台完全重复 -> ErrDuplicatePlatform。
+// 与 Tag 同为一次原子提交（内部经 BeginCommit 进入提交区间）。
 func (r *Registry) AttachPlatform(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	release := r.BeginCommit()
+	defer release()
+	return r.attachLocked(ctx, ref, m, p)
+}
+
+// AttachPlatformInCommit 在调用方已通过 BeginCommit 持有的提交区间内
+// 执行 AttachPlatform，用于“先组装、后追加发布”的单次原子提交编排。
+func (r *Registry) AttachPlatformInCommit(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
 	return r.attachLocked(ctx, ref, m, p)
 }
 
@@ -335,57 +402,99 @@ func variantOf(v string) string {
 	return "/" + v
 }
 
-// reachableFrom 计算某对象的完整可达闭包（索引->清单->config/layers），
-// 起始对象本身也计入。任何引用对象损坏/缺失都作为错误返回，不静默忽略。
-func (r *Registry) reachableFrom(ctx context.Context, start digest.Digest, into map[digest.Digest]struct{}) error {
-	if _, seen := into[start]; seen {
+// walkClosure 校验并遍历某对象的完整可达闭包（索引->清单->config/layers），
+// 起始对象本身也计入。完整性判定一律走 store.Inspect 的统一口径，
+// 并带上描述符声明的大小，使三类结论（不存在/长度不符/摘要不符）
+// 在回收、读取与提交前检查中完全一致；任何引用对象损坏/缺失都作为
+// 错误返回，不静默忽略或跳过。
+//
+// where 标注 d 在引用结构中的位置（如 "index manifests[0]"、"config"），
+// 仅用于让错误能对上具体位置。
+func (r *Registry) walkClosure(ctx context.Context, where string, d manifest.Descriptor, into map[digest.Digest]struct{}) error {
+	if err := d.Validate(true); err != nil {
+		return fmt.Errorf("%w: %s descriptor: %v", manifest.ErrMalformed, where, err)
+	}
+	if _, seen := into[d.Digest]; seen {
 		return nil
 	}
-	into[start] = struct{}{}
+	if _, err := r.store.Inspect(ctx, d.Digest, d.Size); err != nil {
+		return fmt.Errorf("%s %s: %w", where, d.Digest.Short(), err)
+	}
+	into[d.Digest] = struct{}{}
 
-	mt, data, err := manifest.GetManifest(ctx, r.store, start)
+	// config / 层是闭包叶子：只做存在性/大小/摘要校验，不解析为清单。
+	if d.MediaType == manifest.MediaTypeConfig || d.MediaType == manifest.MediaTypeLayer {
+		return nil
+	}
+
+	mt, data, err := manifest.GetManifest(ctx, r.store, d.Digest)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s %s: %w", where, d.Digest.Short(), err)
+	}
+	// 描述符标识与对象实际种类必须一致，不允许混用。
+	if mt != d.MediaType {
+		return fmt.Errorf("%w: %s %s declared mediaType %s but content is %s",
+			manifest.ErrMalformed, where, d.Digest.Short(), d.MediaType, mt)
 	}
 	switch mt {
 	case manifest.MediaTypeIndex:
 		idx, perr := manifest.ParseIndex(data)
 		if perr != nil {
-			return perr
+			return fmt.Errorf("%s %s: %w", where, d.Digest.Short(), perr)
 		}
-		for _, d := range idx.Manifests {
-			if err := r.reachableFrom(ctx, d.Digest, into); err != nil {
+		for i, child := range idx.Manifests {
+			cwhere := fmt.Sprintf("%s manifests[%d]", where, i)
+			if err := r.walkClosure(ctx, cwhere, child, into); err != nil {
 				return err
 			}
 		}
 	case manifest.MediaTypeManifest:
 		m, perr := manifest.ParseManifest(data)
 		if perr != nil {
-			return perr
+			return fmt.Errorf("%s %s: %w", where, d.Digest.Short(), perr)
 		}
-		// 回收按摘要校验全部可达对象：config 与每个层都必须存在且完整，
-		// 缺失/损坏/截断在此显式暴露，由 GC 中止本轮，绝不静默忽略或误删。
+		if m.Config.MediaType != manifest.MediaTypeConfig {
+			return fmt.Errorf("%w: %s config mediaType %s", manifest.ErrMalformed, where, m.Config.MediaType)
+		}
 		targets := []struct {
 			where string
-			d     digest.Digest
+			d     manifest.Descriptor
 		}{
-			{"config", m.Config.Digest},
+			{where + " config", m.Config},
 		}
 		for i, l := range m.Layers {
+			if l.MediaType != manifest.MediaTypeLayer {
+				return fmt.Errorf("%w: %s layers[%d] mediaType %s",
+					manifest.ErrMalformed, where, i, l.MediaType)
+			}
 			targets = append(targets, struct {
 				where string
-				d     digest.Digest
-			}{fmt.Sprintf("layers[%d]", i), l.Digest})
+				d     manifest.Descriptor
+			}{fmt.Sprintf("%s layers[%d]", where, i), l})
 		}
 		for _, tgt := range targets {
-			if _, verr := r.store.Stat(ctx, tgt.d); verr != nil {
-				return fmt.Errorf("reference %s %s %s: %w",
-					start.Short(), tgt.where, tgt.d.Short(), verr)
+			if err := r.walkClosure(ctx, tgt.where, tgt.d, into); err != nil {
+				return err
 			}
-			into[tgt.d] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// VerifyClosure 完整校验“把 target 挂到引用上”所需的整棵对象树：
+// target 自身、索引选中的每个清单、清单的 config 与每个层都必须存在、
+// 长度与声明一致、摘要通过。这是提交动作发布引用前的强制闸门，
+// 也是回收可达性判定共用的同一套口径。
+//
+// target 的 mediaType 必须是清单或索引；描述符自身非法或闭包中任一
+// 对象的三类完整性错误都会原样返回（可用 errors.Is 精确归类）。
+func (r *Registry) VerifyClosure(ctx context.Context, target manifest.Descriptor) error {
+	if target.MediaType != manifest.MediaTypeManifest && target.MediaType != manifest.MediaTypeIndex {
+		return fmt.Errorf("%w: reference target must be manifest or index, got %s",
+			manifest.ErrUnsupportedFormat, target.MediaType)
+	}
+	seen := map[digest.Digest]struct{}{}
+	return r.walkClosure(ctx, "target", target, seen)
 }
 
 // ReferencedBlobs 返回 ref 当前可达的全部对象摘要，供回收判定。
@@ -395,7 +504,7 @@ func (r *Registry) ReferencedBlobs(ctx context.Context, ref string) (map[digest.
 		return nil, err
 	}
 	out := map[digest.Digest]struct{}{}
-	if err := r.reachableFrom(ctx, rec.Target.Digest, out); err != nil {
+	if err := r.walkClosure(ctx, "reference "+ref, rec.Target, out); err != nil {
 		return nil, err
 	}
 	return out, nil

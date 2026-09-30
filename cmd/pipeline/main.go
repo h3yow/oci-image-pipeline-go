@@ -22,9 +22,11 @@ import (
 
 	"github.com/h3yow/oci-image-pipeline-go/internal/assemble"
 	"github.com/h3yow/oci-image-pipeline-go/internal/cas"
+	"github.com/h3yow/oci-image-pipeline-go/internal/commit"
 	"github.com/h3yow/oci-image-pipeline-go/internal/gc"
 	"github.com/h3yow/oci-image-pipeline-go/internal/manifest"
 	"github.com/h3yow/oci-image-pipeline-go/internal/registry"
+	"github.com/h3yow/oci-image-pipeline-go/internal/verify"
 )
 
 func main() {
@@ -148,14 +150,15 @@ func cmdBuild(args []string) error {
 		Config: map[string]any{"os": *osName, "architecture": *arch},
 		Layers: []assemble.LayerSpec{{Name: "context", Files: files}},
 	}
-	desc, report, err := assemble.New(store).AssembleImage(context.Background(), spec)
+	// build 即一次原子提交：组装 + 整闭包校验 + 原子挂引用。
+	res, err := commit.New(store, reg).Commit(context.Background(), commit.Request{
+		Ref:   ref,
+		Image: spec,
+	})
 	if err != nil {
 		return err
 	}
-	if err := reg.Tag(context.Background(), ref, desc); err != nil {
-		return err
-	}
-	return printJSON(report)
+	return printJSON(res)
 }
 
 func cmdAttach(args []string) error {
@@ -184,15 +187,17 @@ func cmdAttach(args []string) error {
 		Config: map[string]any{"os": *osName, "architecture": *arch},
 		Layers: []assemble.LayerSpec{{Name: "context", Files: files}},
 	}
-	desc, report, err := assemble.New(store).AssembleImage(context.Background(), spec)
+	// attach 即一次原子提交：组装 + 追加进索引，发布前整闭包校验。
+	res, err := commit.New(store, reg).Commit(context.Background(), commit.Request{
+		Ref:      ref,
+		Image:    spec,
+		Platform: manifest.Platform{OS: *osName, Architecture: *arch, Variant: *variant},
+		AsIndex:  true,
+	})
 	if err != nil {
 		return err
 	}
-	platform := manifest.Platform{OS: *osName, Architecture: *arch, Variant: *variant}
-	if err := reg.AttachPlatform(context.Background(), ref, desc, platform); err != nil {
-		return err
-	}
-	return printJSON(report)
+	return printJSON(res)
 }
 
 func cmdSelect(args []string) error {
@@ -250,29 +255,50 @@ func cmdGC(args []string) error {
 }
 
 func cmdVerify(args []string) error {
-	if len(args) != 1 {
-		return errors.New("usage: pipeline verify <dir>")
+	jsonOut := false
+	rest := args
+	// 支持 pipeline verify [--json] <dir>。
+	if len(rest) >= 2 && rest[0] == "--json" {
+		jsonOut = true
+		rest = rest[1:]
 	}
-	store, _, err := openAll(args[0])
+	if len(rest) != 1 {
+		return errors.New("usage: pipeline verify [--json] <dir>")
+	}
+	store, reg, err := openAll(rest[0])
 	if err != nil {
 		return err
 	}
-	all, err := store.List(context.Background())
+	rep, err := verify.New(store, reg).Run(context.Background())
 	if err != nil {
 		return err
 	}
-	bad := 0
-	for _, d := range all {
-		if _, err := store.GetBytes(context.Background(), d); err != nil {
-			bad++
-			fmt.Printf("BAD  %s: %v\n", d.Short(), err)
-		} else {
-			fmt.Printf("OK   %s\n", d.Short())
+	if jsonOut {
+		if err := printJSON(rep); err != nil {
+			return err
+		}
+	} else {
+		for _, f := range rep.Findings {
+			switch f.Status {
+			case verify.StatusOK:
+				fmt.Printf("OK      %s\n", f.Digest.Short())
+			case verify.StatusMissing:
+				fmt.Printf("MISSING %s declared=%d: 被引用但对象不存在\n", f.Digest.Short(), f.DeclaredSize)
+			case verify.StatusSizeMismatch:
+				fmt.Printf("TRUNC   %s declared=%d actual=%d: %s\n",
+					f.Digest.Short(), f.DeclaredSize, f.ActualSize, f.Error)
+			case verify.StatusDigestMismatch:
+				fmt.Printf("TAMPER  %s size=%d: %s\n", f.Digest.Short(), f.ActualSize, f.Error)
+			}
 		}
 	}
+	counts := rep.Counts()
+	bad := counts[verify.StatusMissing] + counts[verify.StatusSizeMismatch] + counts[verify.StatusDigestMismatch]
+	fmt.Printf("verify 汇总: ok=%d missing=%d size-mismatch=%d digest-mismatch=%d\n",
+		counts[verify.StatusOK], counts[verify.StatusMissing],
+		counts[verify.StatusSizeMismatch], counts[verify.StatusDigestMismatch])
 	if bad > 0 {
-		return fmt.Errorf("%d of %d objects failed verification", bad, len(all))
+		return fmt.Errorf("%d objects failed verification", bad)
 	}
-	fmt.Printf("all %d objects verified\n", len(all))
 	return nil
 }
