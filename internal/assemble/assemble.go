@@ -134,6 +134,78 @@ func (a *Assembler) AssembleImage(ctx context.Context, spec ImageSpec) (manifest
 	return mdesc, report, nil
 }
 
+// Plan 是一次组装计算出的“写入前计划”：层 tar 与 config 的原始字节齐备，
+// 可据此在写任何对象前算出整个闭包摘要（供原子提交先 pin 再写）。
+//
+// 它不触碰存储，因此是纯函数式结果：相同 ImageSpec 恒得相同 Plan。
+type Plan struct {
+	// ConfigDoc config 的规范 JSON 字节。
+	ConfigDoc []byte
+	// LayerTars 按顺序的层确定性 tar 字节。
+	LayerTars [][]byte
+	// Report 组装明细（输入指纹、摘要、大小），便于日志解释。
+	Report *Report
+}
+
+// PlanImage 只计算组装计划，不写入存储。调用方可把结果交给
+// registry.CommitImagePlan / CommitPlatformPlan 做原子提交。
+func PlanImage(spec ImageSpec) (*Plan, manifest.Descriptor, error) {
+	report := &Report{}
+	layerTars := make([][]byte, 0, len(spec.Layers))
+	layerDescs := make([]manifest.Descriptor, 0, len(spec.Layers))
+
+	for i, layer := range spec.Layers {
+		tarBytes, err := tarball.Build(layer.Files)
+		if err != nil {
+			return nil, manifest.Descriptor{}, fmt.Errorf("layer %q (%d): %w", layer.Name, i, err)
+		}
+		ld := digest.FromBytes(tarBytes)
+		inputDigest := digest.FromBytes(flattenInput(layer.Files))
+		layerTars = append(layerTars, tarBytes)
+		report.LayerDecisions = append(report.LayerDecisions, LayerDecision{
+			Name:     layer.Name,
+			Digest:   string(ld),
+			Size:     int64(len(tarBytes)),
+			Reused:   false, // 计划阶段不查存储；是否去重由提交时的 Put 决定
+			InputSHA: string(inputDigest),
+		})
+		layerDescs = append(layerDescs, manifest.Descriptor{
+			MediaType: manifest.MediaTypeLayer,
+			Digest:    ld,
+			Size:      int64(len(tarBytes)),
+		})
+	}
+
+	configDoc, err := canonicalConfig(spec.Config)
+	if err != nil {
+		return nil, manifest.Descriptor{}, err
+	}
+	configDigest := digest.FromBytes(configDoc)
+	report.ConfigDigest = string(configDigest)
+
+	m := &manifest.Manifest{
+		SchemaVersion: manifest.SchemaVersion,
+		Config: manifest.Descriptor{
+			MediaType: manifest.MediaTypeConfig,
+			Digest:    configDigest,
+			Size:      int64(len(configDoc)),
+		},
+		Layers: layerDescs,
+	}
+	canonicalManifest, err := manifest.EncodeManifest(m)
+	if err != nil {
+		return nil, manifest.Descriptor{}, err
+	}
+	mdesc := manifest.Descriptor{
+		MediaType: manifest.MediaTypeManifest,
+		Digest:    digest.FromBytes(canonicalManifest),
+		Size:      int64(len(canonicalManifest)),
+	}
+	report.ManifestDesc = mdesc
+
+	return &Plan{ConfigDoc: configDoc, LayerTars: layerTars, Report: report}, mdesc, nil
+}
+
 // canonicalConfig 生成确定性配置字节：忽略 created（固定零值语义），
 // 其余 map 键由 encoding/json 按字典序输出，保证可复现。
 func canonicalConfig(user map[string]any) ([]byte, error) {

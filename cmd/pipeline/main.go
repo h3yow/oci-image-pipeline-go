@@ -25,6 +25,7 @@ import (
 	"github.com/h3yow/oci-image-pipeline-go/internal/gc"
 	"github.com/h3yow/oci-image-pipeline-go/internal/manifest"
 	"github.com/h3yow/oci-image-pipeline-go/internal/registry"
+	"github.com/h3yow/oci-image-pipeline-go/internal/verify"
 )
 
 func main() {
@@ -136,7 +137,7 @@ func cmdBuild(args []string) error {
 	}
 	dir, ref, ctxDir := pos[0], pos[1], pos[2]
 
-	store, reg, err := openAll(dir)
+	_, reg, err := openAll(dir)
 	if err != nil {
 		return err
 	}
@@ -148,14 +149,20 @@ func cmdBuild(args []string) error {
 		Config: map[string]any{"os": *osName, "architecture": *arch},
 		Layers: []assemble.LayerSpec{{Name: "context", Files: files}},
 	}
-	desc, report, err := assemble.New(store).AssembleImage(context.Background(), spec)
+	plan, _, err := assemble.PlanImage(spec)
 	if err != nil {
 		return err
 	}
-	if err := reg.Tag(context.Background(), ref, desc); err != nil {
+	rplan := registry.ImagePlan{ConfigDoc: plan.ConfigDoc}
+	for _, tar := range plan.LayerTars {
+		rplan.Layers = append(rplan.Layers, registry.LayerInput{Tar: tar})
+	}
+	desc, err := reg.CommitImagePlan(context.Background(), ref, rplan)
+	if err != nil {
 		return err
 	}
-	return printJSON(report)
+	plan.Report.ManifestDesc = desc
+	return printJSON(plan.Report)
 }
 
 func cmdAttach(args []string) error {
@@ -172,7 +179,7 @@ func cmdAttach(args []string) error {
 	}
 	dir, ref, ctxDir := pos[0], pos[1], pos[2]
 
-	store, reg, err := openAll(dir)
+	_, reg, err := openAll(dir)
 	if err != nil {
 		return err
 	}
@@ -184,15 +191,22 @@ func cmdAttach(args []string) error {
 		Config: map[string]any{"os": *osName, "architecture": *arch},
 		Layers: []assemble.LayerSpec{{Name: "context", Files: files}},
 	}
-	desc, report, err := assemble.New(store).AssembleImage(context.Background(), spec)
+	plan, _, err := assemble.PlanImage(spec)
 	if err != nil {
 		return err
 	}
 	platform := manifest.Platform{OS: *osName, Architecture: *arch, Variant: *variant}
-	if err := reg.AttachPlatform(context.Background(), ref, desc, platform); err != nil {
+	rplan := registry.ImagePlan{
+		ConfigDoc: plan.ConfigDoc,
+		Platform:  &platform,
+	}
+	for _, tar := range plan.LayerTars {
+		rplan.Layers = append(rplan.Layers, registry.LayerInput{Tar: tar})
+	}
+	if _, err := reg.CommitPlatformPlan(context.Background(), ref, rplan); err != nil {
 		return err
 	}
-	return printJSON(report)
+	return printJSON(plan.Report)
 }
 
 func cmdSelect(args []string) error {
@@ -253,26 +267,36 @@ func cmdVerify(args []string) error {
 	if len(args) != 1 {
 		return errors.New("usage: pipeline verify <dir>")
 	}
-	store, _, err := openAll(args[0])
+	store, reg, err := openAll(args[0])
 	if err != nil {
 		return err
 	}
-	all, err := store.List(context.Background())
+	rep, err := verify.New(store, reg).Run(context.Background())
 	if err != nil {
 		return err
 	}
-	bad := 0
-	for _, d := range all {
-		if _, err := store.GetBytes(context.Background(), d); err != nil {
-			bad++
-			fmt.Printf("BAD  %s: %v\n", d.Short(), err)
-		} else {
-			fmt.Printf("OK   %s\n", d.Short())
+	// 逐对象输出结论（含引用闭包中的角色与引用名），便于转出去排查。
+	for _, f := range rep.Objects {
+		where := f.Digest
+		if f.Ref != "" {
+			where = f.Ref + " -> " + f.Digest
+		}
+		switch f.Kind {
+		case verify.KindOK:
+			fmt.Printf("OK        %s %s\n", f.Role, where)
+		case verify.KindMissing:
+			fmt.Printf("MISSING   %s %s: %s\n", f.Role, where, f.Detail)
+		case verify.KindTruncated:
+			fmt.Printf("TRUNCATED %s %s: %s\n", f.Role, where, f.Detail)
+		case verify.KindTampered:
+			fmt.Printf("TAMPERED  %s %s: %s\n", f.Role, where, f.Detail)
 		}
 	}
+	bad := rep.Count(verify.KindMissing) + rep.Count(verify.KindTruncated) + rep.Count(verify.KindTampered)
 	if bad > 0 {
-		return fmt.Errorf("%d of %d objects failed verification", bad, len(all))
+		return fmt.Errorf("verify: %d problem finding(s) (missing=%d truncated=%d tampered=%d)",
+			bad, rep.Count(verify.KindMissing), rep.Count(verify.KindTruncated), rep.Count(verify.KindTampered))
 	}
-	fmt.Printf("all %d objects verified\n", len(all))
+	fmt.Printf("all %d finding(s) ok\n", len(rep.Objects))
 	return nil
 }

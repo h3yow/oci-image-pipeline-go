@@ -5,10 +5,12 @@
 //   - 只删除“不可达且未被 pin”的对象；删除前对 pin 双检，杜绝与并发
 //     写/读竞争导致的误删，正在写入的对象始终不会以半状态被看到；
 //   - 写 pin 在单次 Put 期间保护对象；对象提交后由“已发布的引用”提供
-//     长期保护。回收是协作式的：仅在显式调用 Run 时发生，调用方若在
-//     “写入→打标/挂索引”之间并发回收，应先完成发布或自行持有读 pin；
-//     已写入但尚未被任何引用指向的对象被回收属于正确行为，下一轮引用
-//     发布后其依赖自然稳定；
+//     长期保护。把“组装并挂引用”作为一次事务的入口
+//     （registry.CommitImagePlan/CommitPlatformPlan）会在写任何对象前
+//     先 pin 整个新闭包、持有到引用原子发布，因而与本回收器并发也没有
+//     “写好了但还没引用”的删除窗口；
+//   - 已写入但始终未被任何引用指向的对象（含失败提交的残留）被回收属于
+//     正确行为，下一轮引用发布后其依赖自然稳定；
 //   - 长期运行下存储占用只随“当前可达对象集”变化，不随历史写入总量
 //     无界膨胀；
 //   - 同时清理 tmp/ 中不属于任何进行中写入的临时文件。
@@ -56,9 +58,15 @@ type Result struct {
 func (c *Collector) Run(ctx context.Context) (*Result, error) {
 	res := &Result{}
 
+	// 独占回收门：从“计算可达闭包”到“完成删除”期间不允许提交事务在跑。
+	// 这样本轮到的可达集不会因为中途有引用发布而过期，杜绝“用旧闭包删除
+	// 新引用对象”；提交彼此仍可并发，只在回收的这一阶段等待。
+	releaseGate := c.store.Lock().BeginCollection()
+
 	// 1) 引用可达闭包。
 	refs, err := c.registry.AllRefs(ctx)
 	if err != nil {
+		releaseGate()
 		return nil, fmt.Errorf("gc: list refs: %w", err)
 	}
 	reachable := make(map[digest.Digest]struct{})
@@ -67,6 +75,7 @@ func (c *Collector) Run(ctx context.Context) (*Result, error) {
 		if err != nil {
 			// 某引用损坏/指向缺失对象：中止本轮，绝不因此删除其（可能暂时
 			// 不可解析的）依赖，避免误伤。错误原因交由调用方区分处理。
+			releaseGate()
 			return nil, fmt.Errorf("gc: resolve %s: %w", ref, err)
 		}
 		for d := range blobs {
@@ -77,6 +86,7 @@ func (c *Collector) Run(ctx context.Context) (*Result, error) {
 	// 2) 扫描全部对象。
 	all, err := c.store.List(ctx)
 	if err != nil {
+		releaseGate()
 		return nil, fmt.Errorf("gc: list objects: %w", err)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
@@ -97,10 +107,14 @@ func (c *Collector) Run(ctx context.Context) (*Result, error) {
 		if err := c.store.Delete(ctx, d); err != nil &&
 			!errors.Is(err, cas.ErrNotFound) {
 			// ErrNotFound=另一轮并发回收已删除，属自然消失；其他错误才中止。
+			releaseGate()
 			return nil, fmt.Errorf("gc: delete %s: %w", d.Short(), err)
 		}
 		res.Deleted = append(res.Deleted, string(d))
 	}
+	// 删除阶段结束即可放行提交；下面的临时文件清理只依赖 tmp pin 集合，
+	// 与引用发布无关。
+	releaseGate()
 
 	// 4) 清理无主临时文件。
 	stale, err := c.cleanStaleTmp(ctx)

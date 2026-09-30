@@ -120,8 +120,13 @@ func TestEndToEnd(t *testing.T) {
 	if !errors.Is(err, cas.ErrCorrupt) {
 		t.Fatalf("截断层必须 ErrCorrupt，got %v", err)
 	}
-	if !errors.Is(err, cas.ErrDigestMismatch) {
-		t.Fatalf("截断层错误应保留 ErrDigestMismatch 因果，got %v", err)
+	if errors.Is(err, cas.ErrNotFound) {
+		t.Fatalf("截断层不得伪装成 ErrNotFound，got %v", err)
+	}
+	// 带描述符声明大小的统一口径下，截断细分到 ErrSizeMismatch。
+	_, cerr := store.Check(ctx, layer.Digest, int64(len(good)))
+	if !errors.Is(cerr, cas.ErrSizeMismatch) {
+		t.Fatalf("带声明大小校验截断必须 ErrSizeMismatch，got %v", cerr)
 	}
 
 	// GC 面对损坏引用必须中止而非误删（ReferencedBlobs 返回错误）。

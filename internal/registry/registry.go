@@ -95,6 +95,9 @@ func (r *Registry) refPath(ref string) (string, error) {
 	return filepath.Join(r.root, rel), nil
 }
 
+// RefPathForTest 返回引用文件路径，仅供测试构造存量损坏/旧格式场景。
+func (r *Registry) RefPathForTest(ref string) (string, error) { return r.refPath(ref) }
+
 // atomicWriteRef 同目录临时文件 + 原子 rename 发布引用，杜绝半写入可见。
 func (r *Registry) atomicWriteRef(p string, doc []byte) (err error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -173,11 +176,36 @@ func (r *Registry) Resolve(_ context.Context, ref string) (manifest.Descriptor, 
 	return rec.Target, nil
 }
 
-// Tag 将引用原子指向 desc。desc 须通过描述符校验。
-func (r *Registry) Tag(_ context.Context, ref string, desc manifest.Descriptor) error {
+// Tag 将引用原子指向 desc。发布前对 desc 的整个闭包做完整性校验：
+// 成功后引用一定指向“从头到尾完整可用”的镜像；校验不过则引用不动。
+// desc 三要素或闭包不合法时返回错误（可用 errors.Is 区分原因）。
+func (r *Registry) Tag(ctx context.Context, ref string, desc manifest.Descriptor) error {
 	if err := desc.Validate(true); err != nil {
 		return err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	releaseGate := r.store.Lock().BeginCommit()
+	defer releaseGate()
+	return r.publishLocked(ctx, ref, desc)
+}
+
+// publishLocked 在已持有 r.mu 的条件下原子发布“ref -> desc”：
+//  1. 对 desc 整个可达闭包按描述符声明大小逐个校验（缺失/截断/篡改），
+//     校验期间对每个对象先 pin；
+//  2. 全部通过才把引用文件同目录临时文件 + rename 原子替换；
+//  3. 无论成功失败，结束时释放本函数登记的全部 pin。
+//
+// 因此“校验通过的对象在引用 rename 之前被并发回收删掉”的窗口不存在：
+// GC 只能删除既不可达又未被 pin 的对象，而这些对象在 rename 前由 pin
+// 保护、rename 后由新引用的可达性保护。
+func (r *Registry) publishLocked(ctx context.Context, ref string, desc manifest.Descriptor) error {
+	_, release, err := r.VerifyClosurePinned(ctx, desc.Digest, desc.Size)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	p, err := r.refPath(ref)
 	if err != nil {
 		return err
@@ -186,14 +214,110 @@ func (r *Registry) Tag(_ context.Context, ref string, desc manifest.Descriptor) 
 	if err != nil {
 		return err
 	}
-	doc = append(doc, '\n')
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.atomicWriteRef(p, doc)
+	return r.atomicWriteRef(p, append(doc, '\n'))
 }
 
-// attachLocked 在持锁条件下把平台清单并入引用目标索引。
+// publishIfBaseLocked 在 publishLocked 基础上增加乐观并发控制：仅当引用
+// 当前基线仍等于 base（不存在基线与“引用不存在”一一对应）时才发布；
+// 若期间已被另一事务改到别处，返回 ErrCommitConflict，调用方应重新读取、
+// 重新组装后重试。这保证并发平台追加不会互相覆盖（lost update）。
+func (r *Registry) publishIfBaseLocked(ctx context.Context, ref string, desc manifest.Descriptor, base refBase) error {
+	cur, err := r.currentBaseLocked(ref)
+	if err != nil {
+		return err
+	}
+	if cur.exists != base.exists || cur.root != base.root {
+		curShort := digest.Digest("")
+		if cur.exists {
+			curShort = cur.root
+		}
+		return fmt.Errorf("%w: %s changed during commit (base %s, now %s)",
+			ErrCommitConflict, ref, base.root.Short(), curShort.Short())
+	}
+	return r.publishLocked(ctx, ref, desc)
+}
+
+// attachLocked 在持锁条件下把“已在存储中”的平台清单并入引用索引并原子
+// 条件发布。
+//
+// 它与 CommitPlatformPlan 的差别仅在于清单对象已提前由调用方写好：新平台
+// 闭包在事务内先 pin + 校验，旧闭包由 beginCommit pin，新索引摘要先 pin
+// 再落地，发布前比对基线。若调用方无法保证“写入 -> 提交”期间没有并发
+// 回收，应改用 CommitPlatformPlan（写前即 pin）。
 func (r *Registry) attachLocked(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
+	ps, base, err := r.beginCommit(ctx, ref)
+	if err != nil {
+		return err
+	}
+	defer ps.release()
+
+	// 新平台闭包 pin + 校验。
+	if err := ps.pinClosure(ctx, r, m.Digest, m.Size); err != nil {
+		return err
+	}
+
+	idx, err := r.loadIndexForAppendLocked(ctx, ref, m, p)
+	if err != nil {
+		return err
+	}
+	canonical, err := manifest.EncodeIndex(idx)
+	if err != nil {
+		return err
+	}
+	ps.add(r.store.Lock().Pin(digest.FromBytes(canonical)))
+	desc, err := manifest.PutManifest(ctx, r.store, canonical)
+	if err != nil {
+		return err
+	}
+	return r.publishIfBaseLocked(ctx, ref, desc, base)
+}
+
+// loadIndexForAppendLocked 读取 ref 当前索引（不存在则新建），并把平台 m
+// 追加进去，返回待编码的索引结构。平台重复 / 目标不是索引在此报错。
+func (r *Registry) loadIndexForAppendLocked(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) (*manifest.Index, error) {
+	var idx *manifest.Index
+	if rec, err := r.loadRecord(ref); err == nil {
+		if rec.Target.MediaType != manifest.MediaTypeIndex {
+			return nil, fmt.Errorf("%w: %s points at %s, not an index",
+				ErrWrongKind, ref, rec.Target.MediaType)
+		}
+		_, data, gerr := manifest.GetManifest(ctx, r.store, rec.Target.Digest)
+		if gerr != nil {
+			return nil, gerr
+		}
+		parsed, perr := manifest.ParseIndex(data)
+		if perr != nil {
+			return nil, perr
+		}
+		idx = parsed
+	} else if errors.Is(err, ErrNoSuchRef) {
+		idx = &manifest.Index{SchemaVersion: manifest.SchemaVersion}
+	} else {
+		return nil, err
+	}
+	for _, existing := range idx.Manifests {
+		if existing.Platform != nil && existing.Platform.Equal(p) {
+			return nil, fmt.Errorf("%w: %s/%s%s already attached",
+				ErrDuplicatePlatform, p.OS, p.Architecture, variantOf(p.Variant))
+		}
+	}
+	idx.Manifests = append(idx.Manifests, entryFor(m, p))
+	return idx, nil
+}
+
+// entryFor 给清单描述符附上平台标注。
+func entryFor(m manifest.Descriptor, p manifest.Platform) manifest.Descriptor {
+	entry := m
+	entry.Platform = &p
+	return entry
+}
+
+// AttachPlatform 将一个已在存储中的平台清单挂到 ref 指向的索引下；
+// ref 尚不存在时创建索引。平台完全重复 -> ErrDuplicatePlatform。
+//
+// 注意：本方法假定清单对象已写好。存在并发回收时，调用方若无法保证
+// “写入 -> 提交”之间对象不被回收，应改用 CommitPlatformPlan。
+func (r *Registry) AttachPlatform(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
 	if err := m.Validate(true); err != nil {
 		return err
 	}
@@ -204,63 +328,14 @@ func (r *Registry) attachLocked(ctx context.Context, ref string, m manifest.Desc
 	if err := p.Valid(); err != nil {
 		return err
 	}
-	entry := m
-	entry.Platform = &p
-
-	var idx *manifest.Index
-	if rec, err := r.loadRecord(ref); err == nil {
-		if rec.Target.MediaType != manifest.MediaTypeIndex {
-			return fmt.Errorf("%w: %s points at %s, not an index",
-				ErrWrongKind, ref, rec.Target.MediaType)
-		}
-		_, data, gerr := manifest.GetManifest(ctx, r.store, rec.Target.Digest)
-		if gerr != nil {
-			return gerr
-		}
-		idx, err = manifest.ParseIndex(data)
-		if err != nil {
-			return err
-		}
-	} else if errors.Is(err, ErrNoSuchRef) {
-		idx = &manifest.Index{SchemaVersion: manifest.SchemaVersion}
-	} else {
-		return err
-	}
-
-	// 平台重复检测：不得任选其一，直接拒绝。
-	for _, existing := range idx.Manifests {
-		if existing.Platform != nil && existing.Platform.Equal(p) {
-			return fmt.Errorf("%w: %s/%s%s already attached",
-				ErrDuplicatePlatform, p.OS, p.Architecture, variantOf(p.Variant))
-		}
-	}
-	idx.Manifests = append(idx.Manifests, entry)
-
-	canonical, err := manifest.EncodeIndex(idx)
-	if err != nil {
-		return err
-	}
-	desc, err := manifest.PutManifest(ctx, r.store, canonical)
-	if err != nil {
-		return err
-	}
-	p2, err := r.refPath(ref)
-	if err != nil {
-		return err
-	}
-	doc, err := json.Marshal(refRecord{FormatVersion: CurrentRefFormatVersion, Target: desc})
-	if err != nil {
-		return err
-	}
-	return r.atomicWriteRef(p2, append(doc, '\n'))
-}
-
-// AttachPlatform 将一个平台清单挂到 ref 指向的索引下；
-// ref 尚不存在时创建索引。平台完全重复 -> ErrDuplicatePlatform。
-func (r *Registry) AttachPlatform(ctx context.Context, ref string, m manifest.Descriptor, p manifest.Platform) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.attachLocked(ctx, ref, m, p)
+	releaseGate := r.store.Lock().BeginCommit()
+	defer releaseGate()
+	if err := r.attachLocked(ctx, ref, m, p); err != nil {
+		return classifyCommitError(err)
+	}
+	return nil
 }
 
 // SelectPlatform 在 ref 指向的索引中按平台选择唯一清单描述符：
@@ -336,54 +411,15 @@ func variantOf(v string) string {
 }
 
 // reachableFrom 计算某对象的完整可达闭包（索引->清单->config/layers），
-// 起始对象本身也计入。任何引用对象损坏/缺失都作为错误返回，不静默忽略。
-func (r *Registry) reachableFrom(ctx context.Context, start digest.Digest, into map[digest.Digest]struct{}) error {
-	if _, seen := into[start]; seen {
-		return nil
-	}
-	into[start] = struct{}{}
-
-	mt, data, err := manifest.GetManifest(ctx, r.store, start)
+// 起始对象本身也计入。任何引用对象缺失/截断/篡改都按统一三类口径作为错误
+// 返回，不静默忽略（校验与提交前检查走同一份 VerifyClosure 判定）。
+func (r *Registry) reachableFrom(ctx context.Context, start digest.Digest, declaredSize int64, into map[digest.Digest]struct{}) error {
+	objs, err := r.VerifyClosure(ctx, start, declaredSize)
 	if err != nil {
 		return err
 	}
-	switch mt {
-	case manifest.MediaTypeIndex:
-		idx, perr := manifest.ParseIndex(data)
-		if perr != nil {
-			return perr
-		}
-		for _, d := range idx.Manifests {
-			if err := r.reachableFrom(ctx, d.Digest, into); err != nil {
-				return err
-			}
-		}
-	case manifest.MediaTypeManifest:
-		m, perr := manifest.ParseManifest(data)
-		if perr != nil {
-			return perr
-		}
-		// 回收按摘要校验全部可达对象：config 与每个层都必须存在且完整，
-		// 缺失/损坏/截断在此显式暴露，由 GC 中止本轮，绝不静默忽略或误删。
-		targets := []struct {
-			where string
-			d     digest.Digest
-		}{
-			{"config", m.Config.Digest},
-		}
-		for i, l := range m.Layers {
-			targets = append(targets, struct {
-				where string
-				d     digest.Digest
-			}{fmt.Sprintf("layers[%d]", i), l.Digest})
-		}
-		for _, tgt := range targets {
-			if _, verr := r.store.Stat(ctx, tgt.d); verr != nil {
-				return fmt.Errorf("reference %s %s %s: %w",
-					start.Short(), tgt.where, tgt.d.Short(), verr)
-			}
-			into[tgt.d] = struct{}{}
-		}
+	for _, o := range objs {
+		into[o.Digest] = struct{}{}
 	}
 	return nil
 }
@@ -395,7 +431,7 @@ func (r *Registry) ReferencedBlobs(ctx context.Context, ref string) (map[digest.
 		return nil, err
 	}
 	out := map[digest.Digest]struct{}{}
-	if err := r.reachableFrom(ctx, rec.Target.Digest, out); err != nil {
+	if err := r.reachableFrom(ctx, rec.Target.Digest, rec.Target.Size, out); err != nil {
 		return nil, err
 	}
 	return out, nil

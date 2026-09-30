@@ -73,19 +73,68 @@ func (s *Store) gate(d digest.Digest) *sync.Mutex {
 	return mu.(*sync.Mutex)
 }
 
-// verifyFile 全量计算已落地文件的摘要并与 expected 比对。
-func verifyFile(f *os.File, expected digest.Digest) (int64, error) {
-	h := sha256.New()
-	n, err := io.Copy(h, f)
+// checkFile 按统一完整性口径校验已落地对象，返回其实际大小：
+//
+//   - 文件缺失 -> ErrNotFound；
+//   - wantSize >= 0 且实际长度不一致 -> ErrCorrupt+ErrSizeMismatch（截断/追加）；
+//   - 长度一致（或 wantSize < 0 跳过大小判定）但摘要不符 ->
+//     ErrCorrupt+ErrDigestMismatch（内容被篡改）；
+//   - 完整 -> 实际大小。
+//
+// 不负责 pin；调用方按需自行持有读 pin。
+func (s *Store) checkFile(d digest.Digest, wantSize int64) (int64, error) {
+	p, err := s.Path(d)
 	if err != nil {
+		return 0, err
+	}
+	f, err := os.Open(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, fmt.Errorf("%w: %s", ErrNotFound, d.Short())
+	}
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.IsDir() {
+		return 0, fmt.Errorf("%w: %s is a directory", ErrCorrupt, p)
+	}
+	n := info.Size()
+	if wantSize >= 0 && n != wantSize {
+		// 长度先对不上：明确归类为截断/追加，不再用摘要错误笼统代替。
+		return n, fmt.Errorf("%w: %w: %s size=%d, declared %d",
+			ErrCorrupt, ErrSizeMismatch, d.Short(), n, wantSize)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
 		return n, err
 	}
 	got := digest.AlgorithmSHA256 + ":" + hex.EncodeToString(h.Sum(nil))
-	if digest.Digest(got) != expected {
-		return n, fmt.Errorf("%w: expected %s, file computes %s (size=%d)",
-			ErrDigestMismatch, expected, got, n)
+	if digest.Digest(got) != d {
+		// 长度一致而摘要不符：内容被改过，与“截断”明确区分。
+		return n, fmt.Errorf("%w: %w: %s computes %s (size=%d)",
+			ErrCorrupt, ErrDigestMismatch, d.Short(), got, n)
 	}
 	return n, nil
+}
+
+// Check 是 checkFile 的导出入口：按统一三类口径校验对象。
+//
+// wantSize < 0 表示调用方没有声明大小（如按摘要直接读取、全库枚举校验），
+// 此时只做摘要校验；凡能拿到描述符声明大小的路径（引用闭包、提交前检查）
+// 都应传入声明大小以获得截断/篡改的细分结论。
+//
+// Check 不持有读 pin；需要与回收并发、且要求“检查期间对象不得被删”的
+// 调用方，应自行用 Lock().BeginRead(d) … Lock().EndRead(d) 包裹检查周期，
+// 并把释放时机推迟到后续原子发布完成之后。
+func (s *Store) Check(_ context.Context, d digest.Digest, wantSize int64) (int64, error) {
+	if _, err := digest.Parse(string(d)); err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvalidDigest, err)
+	}
+	return s.checkFile(d, wantSize)
 }
 
 // existingIntact 检查对象是否已完整存在：
@@ -94,27 +143,11 @@ func verifyFile(f *os.File, expected digest.Digest) (int64, error) {
 //	false  -> 不存在
 //	error  -> 存在但损坏（调用方可安全覆盖：损坏对象不是有效内容）
 func (s *Store) existingIntact(d digest.Digest) (bool, error) {
-	p, err := s.Path(d)
-	if err != nil {
-		return false, err
-	}
-	info, err := os.Stat(p)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.IsDir() {
-		return false, fmt.Errorf("%w: %s is a directory", ErrCorrupt, p)
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	if _, err := verifyFile(f, d); err != nil {
-		return false, fmt.Errorf("existing object %s: %w: %v", d.Short(), ErrCorrupt, err)
+	if _, err := s.checkFile(d, -1); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("existing object %s: %w", d.Short(), err)
 	}
 	return true, nil
 }
@@ -279,8 +312,13 @@ func (v *verifyingReadCloser) Close() error {
 // Get 返回对象内容的读取器与其字节数；打开前做完整校验，
 // 读取期间通过 pin 阻止回收，Close 时再次复核。
 //
+// 按摘要直接读取时没有声明大小，故这里只细分“缺失/损坏”；需要进一步
+// 区分截断（ErrSizeMismatch）与篡改（ErrDigestMismatch）的调用方
+// （引用闭包、提交前检查）应在持有描述符时使用 Check(d, declaredSize)。
+//
 //   - 对象缺失 -> ErrNotFound；
-//   - 对象存在但损坏/截断/被篡改 -> ErrCorrupt（errors.Is 同时命中 ErrDigestMismatch）。
+//   - 对象存在但损坏 -> ErrCorrupt（并按原因链 ErrSizeMismatch/
+//     ErrDigestMismatch）。
 func (s *Store) Get(ctx context.Context, d digest.Digest) (io.ReadCloser, int64, error) {
 	if _, err := digest.Parse(string(d)); err != nil {
 		return nil, 0, fmt.Errorf("%w: %v", ErrInvalidDigest, err)
@@ -290,25 +328,13 @@ func (s *Store) Get(ctx context.Context, d digest.Digest) (io.ReadCloser, int64,
 		return nil, 0, err
 	}
 	s.locker.BeginRead(d)
-	f, err := os.Open(p)
-	if errors.Is(err, os.ErrNotExist) {
-		s.locker.EndRead(d)
-		return nil, 0, fmt.Errorf("%w: %s", ErrNotFound, d.Short())
-	}
-	if err != nil {
-		s.locker.EndRead(d)
-		return nil, 0, err
-	}
-	size, verr := verifyFile(f, d)
+	size, verr := s.checkFile(d, -1)
 	if verr != nil {
-		f.Close()
 		s.locker.EndRead(d)
-		// 损坏绝不静默退化为“未命中”：返回独立可判定的 ErrCorrupt，
-		// 并保留 ErrDigestMismatch 因果链。
-		return nil, 0, fmt.Errorf("%w: %s: %w", ErrCorrupt, d.Short(), verr)
+		return nil, 0, verr
 	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		f.Close()
+	f, err := os.Open(p)
+	if err != nil {
 		s.locker.EndRead(d)
 		return nil, 0, err
 	}
@@ -325,13 +351,14 @@ func (s *Store) GetBytes(ctx context.Context, d digest.Digest) ([]byte, error) {
 	return io.ReadAll(rc)
 }
 
-// Stat 返回对象大小；缺失 -> ErrNotFound，损坏/截断 -> ErrCorrupt。
+// Stat 返回对象大小；整个判定期间持有读 pin。
+// 缺失 -> ErrNotFound，截断 -> ErrCorrupt+ErrSizeMismatch，
+// 篡改 -> ErrCorrupt+ErrDigestMismatch。
 func (s *Store) Stat(ctx context.Context, d digest.Digest) (int64, error) {
-	rc, size, err := s.Get(ctx, d)
-	if err != nil {
-		return 0, err
-	}
-	return size, rc.Close()
+	s.locker.BeginRead(d)
+	n, err := s.Check(ctx, d, -1)
+	s.locker.EndRead(d)
+	return n, err
 }
 
 // Exists 仅当对象存在且完整时返回 (true,nil)；
