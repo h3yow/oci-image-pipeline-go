@@ -71,6 +71,21 @@ func (r *Registry) BeginGC() { r.gcMu.Lock() }
 // EndGC 结束一轮回收的互斥区间。
 func (r *Registry) EndGC() { r.gcMu.Unlock() }
 
+// BeginSnapshot / EndSnapshot 由只读全库巡检（verify）在整轮枚举与
+// 逐对象判定前后成对调用。它与 BeginCommit 一样取得 gcMu 的读锁：
+//   - 巡检期间不会有 gc.Run 穿插（gc 持写锁），因此被引用对象不会在
+//     巡检中途被删掉，巡检不会把“此刻正被引用的对象”误报为 missing；
+//   - 多个提交/巡检可以并发；引用与对象各自原子发布，巡检看到的引用
+//     状态要么是提交前、要么是提交后（两者闭包都完整），不会出现
+//     “引用已坏掉、巡检却给出绿色结论”的窗口。
+//
+// 纯快照读取不串行化引用变更（不取 mu）：引用文件经原子 rename
+// 发布，任何一次读取拿到的不是旧文档就是新文档，不存在半份文档。
+func (r *Registry) BeginSnapshot() { r.gcMu.RLock() }
+
+// EndSnapshot 结束一轮巡检的快照区间。
+func (r *Registry) EndSnapshot() { r.gcMu.RUnlock() }
+
 // New 打开 root 下的本地仓库。
 func New(store *cas.Store) (*Registry, error) {
 	root := filepath.Join(store.Root(), "refs")

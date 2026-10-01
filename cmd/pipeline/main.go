@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/h3yow/oci-image-pipeline-go/internal/assemble"
 	"github.com/h3yow/oci-image-pipeline-go/internal/cas"
@@ -281,24 +282,54 @@ func cmdVerify(args []string) error {
 		for _, f := range rep.Findings {
 			switch f.Status {
 			case verify.StatusOK:
-				fmt.Printf("OK      %s\n", f.Digest.Short())
+				fmt.Printf("OK       %s\n", f.Digest.Short())
 			case verify.StatusMissing:
-				fmt.Printf("MISSING %s declared=%d: 被引用但对象不存在\n", f.Digest.Short(), f.DeclaredSize)
+				via := refVia(f)
+				fmt.Printf("MISSING  %s declared=%d%s: 被引用但对象不存在\n",
+					f.Digest.Short(), f.DeclaredSize, via)
 			case verify.StatusSizeMismatch:
-				fmt.Printf("TRUNC   %s declared=%d actual=%d: %s\n",
-					f.Digest.Short(), f.DeclaredSize, f.ActualSize, f.Error)
+				via := refVia(f)
+				fmt.Printf("TRUNC    %s declared=%d actual=%d%s: %s\n",
+					f.Digest.Short(), f.DeclaredSize, f.ActualSize, via, f.Error)
 			case verify.StatusDigestMismatch:
-				fmt.Printf("TAMPER  %s size=%d: %s\n", f.Digest.Short(), f.ActualSize, f.Error)
+				via := refVia(f)
+				fmt.Printf("TAMPER   %s size=%d%s: %s\n", f.Digest.Short(), f.ActualSize, via, f.Error)
+			case verify.StatusMalformed:
+				via := refVia(f)
+				fmt.Printf("MALFORM  %s%s: %s\n", f.Digest.Short(), via, f.Error)
+			case verify.StatusUnsupportedFormat:
+				via := refVia(f)
+				fmt.Printf("UNSUPP   %s%s: %s\n", f.Digest.Short(), via, f.Error)
+			}
+		}
+		for _, rf := range rep.RefFindings {
+			switch rf.Status {
+			case verify.StatusCorruptRef:
+				fmt.Printf("BAD-REF  %s: 引用文件损坏或结构不合法: %s\n", rf.Ref, rf.Error)
+			case verify.StatusUnsupportedRefVersion:
+				fmt.Printf("BAD-REF  %s: 引用格式版本超出支持范围: %s\n", rf.Ref, rf.Error)
 			}
 		}
 	}
 	counts := rep.Counts()
-	bad := counts[verify.StatusMissing] + counts[verify.StatusSizeMismatch] + counts[verify.StatusDigestMismatch]
-	fmt.Printf("verify 汇总: ok=%d missing=%d size-mismatch=%d digest-mismatch=%d\n",
+	refCounts := rep.RefCounts()
+	fmt.Printf("verify 汇总: ok=%d missing=%d size-mismatch=%d digest-mismatch=%d malformed=%d unsupported-format=%d；引用: corrupt=%d unsupported-version=%d\n",
 		counts[verify.StatusOK], counts[verify.StatusMissing],
-		counts[verify.StatusSizeMismatch], counts[verify.StatusDigestMismatch])
-	if bad > 0 {
-		return fmt.Errorf("%d objects failed verification", bad)
+		counts[verify.StatusSizeMismatch], counts[verify.StatusDigestMismatch],
+		counts[verify.StatusMalformed], counts[verify.StatusUnsupportedFormat],
+		refCounts[verify.StatusCorruptRef], refCounts[verify.StatusUnsupportedRefVersion])
+	if rep.Failed() {
+		// 任一对象非 OK 或任一引用无法正常解析：巡检必须失败退出，
+		// 绝不打印全绿汇总后返回 0。
+		return fmt.Errorf("verification failed: repository is not healthy")
 	}
 	return nil
+}
+
+// refVia 把“经哪些引用可达”渲染成可读后缀，便于对上报错时定位来源。
+func refVia(f verify.Finding) string {
+	if len(f.ReferencedBy) == 0 {
+		return ""
+	}
+	return " (via " + strings.Join(f.ReferencedBy, ",") + ")"
 }
