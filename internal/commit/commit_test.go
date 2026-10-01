@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -327,6 +328,14 @@ func TestConcurrentCommitGCVerify(t *testing.T) {
 			for st, n := range bad {
 				if n > 0 {
 					errCh <- errVerifySaw(st, n)
+				}
+			}
+			// 引用级结论同样不允许任何非 OK：提交成功后的引用闭包永远完整，
+			// 巡检持检查锁期间 gc 无法穿插，坏引用不可能被漏判也不能误报。
+			for _, rf := range rep.RefFindings {
+				if rf.Status != verify.RefStatusOK {
+					errCh <- fmt.Errorf("并发巡检对引用 %s 出现非预期结论 %s @ %s: %s",
+						rf.Ref, rf.Status, rf.Where, rf.Error)
 				}
 			}
 		}()

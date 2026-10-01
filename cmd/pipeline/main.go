@@ -274,6 +274,8 @@ func cmdVerify(args []string) error {
 		return err
 	}
 	if jsonOut {
+		// JSON 模式：stdout 只输出结构化报告，保证可直接被工具解析；
+		// 人读汇总走 stderr，退出码仍体现成败。
 		if err := printJSON(rep); err != nil {
 			return err
 		}
@@ -291,14 +293,55 @@ func cmdVerify(args []string) error {
 				fmt.Printf("TAMPER  %s size=%d: %s\n", f.Digest.Short(), f.ActualSize, f.Error)
 			}
 		}
+		// 引用逐条结论：明确指出是哪条引用、属于哪一类问题。
+		for _, f := range rep.RefFindings {
+			switch f.Status {
+			case verify.RefStatusOK:
+				fmt.Printf("REF-OK      %s\n", f.Ref)
+			case verify.RefStatusCorruptRef:
+				fmt.Printf("REF-CORRUPT %s %s: 引用文件读不出来或结构不合法: %s\n",
+					f.Ref, f.Where, f.Error)
+			case verify.RefStatusUnsupportedVersion:
+				fmt.Printf("REF-VERSION %s %s: 引用格式版本超出支持范围: %s\n",
+					f.Ref, f.Where, f.Error)
+			case verify.RefStatusMissing:
+				fmt.Printf("REF-MISSING %s @ %s %s declared=%d: 引用指向的对象不存在: %s\n",
+					f.Ref, f.Where, f.Digest.Short(), f.DeclaredSize, f.Error)
+			case verify.RefStatusSizeMismatch:
+				fmt.Printf("REF-TRUNC   %s @ %s %s declared=%d: 引用闭包对象长度不符: %s\n",
+					f.Ref, f.Where, f.Digest.Short(), f.DeclaredSize, f.Error)
+			case verify.RefStatusDigestMismatch:
+				fmt.Printf("REF-TAMPER  %s @ %s %s: 引用闭包对象内容被改: %s\n",
+					f.Ref, f.Where, f.Digest.Short(), f.Error)
+			case verify.RefStatusMalformed:
+				fmt.Printf("REF-MALFORM %s @ %s %s: 引用闭包清单/索引结构不合法: %s\n",
+					f.Ref, f.Where, f.Digest.Short(), f.Error)
+			}
+		}
 	}
 	counts := rep.Counts()
 	bad := counts[verify.StatusMissing] + counts[verify.StatusSizeMismatch] + counts[verify.StatusDigestMismatch]
-	fmt.Printf("verify 汇总: ok=%d missing=%d size-mismatch=%d digest-mismatch=%d\n",
+	summaryOut := os.Stdout
+	if jsonOut {
+		summaryOut = os.Stderr // JSON 模式下 stdout 只能是纯 JSON
+	}
+	fmt.Fprintf(summaryOut, "verify 汇总: ok=%d missing=%d size-mismatch=%d digest-mismatch=%d\n",
 		counts[verify.StatusOK], counts[verify.StatusMissing],
 		counts[verify.StatusSizeMismatch], counts[verify.StatusDigestMismatch])
-	if bad > 0 {
-		return fmt.Errorf("%d objects failed verification", bad)
+	rc := rep.RefCounts()
+	refBad := 0
+	for st, n := range rc {
+		if st != verify.RefStatusOK {
+			refBad += n
+		}
+	}
+	fmt.Fprintf(summaryOut, "verify 引用: ok=%d corrupt-ref=%d unsupported-version=%d missing=%d size-mismatch=%d digest-mismatch=%d malformed=%d\n",
+		rc[verify.RefStatusOK], rc[verify.RefStatusCorruptRef],
+		rc[verify.RefStatusUnsupportedVersion], rc[verify.RefStatusMissing],
+		rc[verify.RefStatusSizeMismatch], rc[verify.RefStatusDigestMismatch],
+		rc[verify.RefStatusMalformed])
+	if bad+refBad > 0 {
+		return fmt.Errorf("verify: %d object(s) and %d reference finding(s) failed verification", bad, refBad)
 	}
 	return nil
 }

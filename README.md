@@ -26,7 +26,7 @@
 | `internal/assemble` | 层、config、清单的可重复组装 |
 | `internal/registry` | 命名引用、多架构索引、平台选择、可达闭包、提交门 |
 | `internal/commit` | 「组装并挂到引用」的单次原子提交编排 |
-| `internal/verify` | 全库逐对象完整性校验（三分类报告） |
+| `internal/verify` | 全库巡检：逐对象完整性三分类 + 逐条引用结论（坏引用/超版本明确失败） |
 | `internal/gc` | 不可达对象回收与陈旧临时文件清理 |
 | `cmd/pipeline` | 本地验证用 CLI |
 
@@ -68,10 +68,30 @@
      `Inspect` 校验，缺任一对象或任一类损坏都**整轮中止**，绝不误删；
   4. **提交前检查**（`registry.VerifyClosure`，见第三节）：引用发布前
      整棵对象树（索引→每个清单→config/每个层）逐对象过 `Inspect`。
-- 全库校验由 `internal/verify` 提供：`verify.Run` 枚举全部对象，对**每个
+- 全库巡检由 `internal/verify` 提供：`verify.Run` 枚举全部对象，对**每个
   对象**给出 `ok / missing / size-mismatch / digest-mismatch` 结论
   （含声明大小、实测长度与原始错误），不会在第一个坏对象处中止，便于
   整库导出排查；被清单/索引声明但不存在的对象记为 `missing`。
+  同时巡检**逐条**检查每个命名引用本身（`refFindings`），与读取、回收、
+  提交前检查共用同一判定口径，各自对上**明确且互斥**的结论类别：
+  1. `corrupt-ref`：引用文件读不出来（JSON 无法解析）或目标结构不合法
+     （描述符三要素非法），对应 `registry.ErrCorruptRef`；
+  2. `unsupported-reference-version`：`formatVersion` 超出当前支持范围，
+     对应 `registry.ErrUnsupportedReferenceVersion`；无版本字段的旧格式
+     引用按 1 解释、照常给 `ok`，两种格式绝不混着解释；
+  3. `missing` / `size-mismatch` / `digest-mismatch`：引用闭包中某对象
+     不存在、长度不符、内容被改——结论带**引用名、闭包位置
+     （如 `target manifests[0] layers[1]`）与对象摘要**；
+  4. `malformed`：闭包中的清单/索引结构不合法，或描述符 mediaType 与
+     对象实际种类不一致（`manifest.ErrMalformed` 等）。
+  坏引用/超版本引用**绝不会被当成“没找到”跳过**：只要存在任一非 OK 的
+  对象结论或引用结论，`Report.Healthy()` 即为 false，`pipeline verify`
+  以**退出码 1** 失败；全绿才退出 0。
+- 巡检并发口径：`verify.Run` 整轮持有 `registry.BeginInspect` 读锁，
+  与 `gc.Run`（写锁）互斥、与提交区间（读锁）可并发。因此提交、回收、
+  巡检同时跑时，不可能出现“引用已坏掉、巡检却对其闭包对象误报缺失/
+  或对坏引用给出绿色结论”的穿插；成功提交发布的引用在任何时刻都指向
+  完整闭包（见第三节提交门与第四节回收锁）。
 - 原子性：写入走“同卷临时文件 → fsync → 原子 rename”，读者只会看到
   “没有对象”或“完整对象”，不存在半写入可见。
 
@@ -237,8 +257,8 @@
 # 全部单元测试（含日志中的输入内容与判定依据）
 go test -v ./...
 
-# 并发压力 + 竞态检测（提交 / 回收 / 校验 一起跑；回收/写入/索引追加）
-go test -race -count=50 ./internal/gc/ ./internal/commit/ ./internal/registry/
+# 并发压力 + 竞态检测（提交 / 回收 / 巡检 一起跑；回收/写入/索引追加）
+go test -race -count=50 ./internal/gc/ ./internal/commit/ ./internal/registry/ ./internal/verify/
 go test -race ./...
 ```
 
@@ -258,9 +278,14 @@ pipeline attach /tmp/repo ns/app:1.0  /tmp/ctx-arm  --os linux --arch arm64
 pipeline select  /tmp/repo ns/app:1.0 --os linux --arch arm64
 pipeline resolve /tmp/repo ns/app:1.0
 
-# 全库逐对象完整性校验：每个对象一行 OK/MISSING/TRUNC(长度不符)/TAMPER(摘要不符)
+# 全库逐对象完整性校验：
+#   每个对象一行 OK/MISSING/TRUNC(长度不符)/TAMPER(摘要不符)；
+#   每条引用一行 REF-OK/REF-CORRUPT/REF-VERSION/REF-MISSING/REF-TRUNC/
+#   REF-TAMPER/REF-MALFORM（带引用名与闭包位置）。
+# 只要有任何对象或引用不是 OK，命令以退出码 1 失败；全绿才 0。
 pipeline verify /tmp/repo
-pipeline verify --json /tmp/repo   # 结构化导出，便于转出去排查
+pipeline verify --json /tmp/repo   # 结构化导出（stdout 纯 JSON，汇总在 stderr）
+echo "exit=$?"                     # 健康 0；存在坏引用/坏对象 1
 
 pipeline gc /tmp/repo             # 打印 visited/kept/deleted/staleTmp 判定明细
 ```
@@ -288,6 +313,61 @@ cp /tmp/$BLOB.bak /tmp/repo/blobs/sha256/$BLOB
 pipeline verify /tmp/repo
 ```
 
+### 复现“坏引用 / 超版本引用被漏报成全绿”（本次修复点）
+
+旧行为：把引用文件本身改坏、或把版本标记改到超范围，巡检仍逐条 OK、
+汇总全绿、退出码 0，排查方向会被直接带偏。现在这两类问题（以及引用
+指向对象缺失/长度不符/内容被改）都会明确报出并失败退出：
+
+```bash
+# 基线：先有一个健康引用
+mkdir -p /tmp/ctx/bin && echo APP > /tmp/ctx/bin/app
+pipeline build /tmp/repo ns/app:1.0 /tmp/ctx --os linux --arch amd64
+pipeline verify /tmp/repo; echo "exit=$?"        # 全绿 -> exit 0
+
+# A) 把引用文件改成读都读不出来的垃圾
+REF=/tmp/repo/refs/ns/app/1.0
+cp "$REF" /tmp/app10.ref.bak
+echo '{not-json' > "$REF"
+pipeline verify /tmp/repo; echo "exit=$?"
+#   REF-CORRUPT ns/app:1.0 reference: ... corrupt reference ... unreadable ...
+#   verify 引用: ok=0 corrupt-ref=1 ...
+#   exit=1
+
+# B) 版本标记改成超出支持范围的值
+cp /tmp/app10.ref.bak "$REF"
+python3 - <<'PY'
+import json
+p="/tmp/repo/refs/ns/app/1.0"
+d=json.load(open(p)); d["formatVersion"]=99
+json.dump(d, open(p,"w"))
+PY
+pipeline verify /tmp/repo; echo "exit=$?"
+#   REF-VERSION ns/app:1.0 reference: ... unsupported reference format version ...
+#   exit=1
+
+# C) 无 formatVersion 的旧格式引用：照常可用（仍 exit 0），不与超版本混判
+python3 - <<'PY'
+import json
+p="/tmp/repo/refs/ns/app/1.0"
+d=json.load(open(p)); d.pop("formatVersion", None)
+json.dump(d, open(p,"w"))
+PY
+pipeline verify /tmp/repo; echo "exit=$?"        # REF-OK -> exit 0
+
+# 结构化导出：findings=对象逐结论，refFindings=引用逐结论（ref/status/where/digest）
+pipeline verify --json /tmp/repo 2>/dev/null | jq '.refFindings'
+
+# D) 引用闭包里的对象缺失 / 截断 / 等长篡改：分别报
+#    REF-MISSING / REF-TRUNC / REF-TAMPER，并带 @ target layers[0] 之类位置
+```
+
+> 判定依据：引用解析错误与读取/回收/提交前检查同源
+> （`ErrCorruptRef`、`ErrUnsupportedReferenceVersion`、`cas` 三类
+> 完整性错误、`manifest.ErrMalformed`），巡检对每条引用独立遍历闭包、
+> 遇错不中止、逐位置记录，因此同一轮里多个坏引用/多个坏位置都会导出；
+> 整轮巡检与 `gc.Run` 互斥，并发下坏引用不可能被漏判成绿色。
+
 ### 复现“失败可重试、不累积垃圾”
 
 ```bash
@@ -309,6 +389,10 @@ ls /tmp/repo/blobs/sha256 | wc -l   # 只与当前仍被引用的镜像集合有
 | 完整性三分类 | `cas.TestInspectThreeClassClassification` | 不存在 `ErrNotFound`、长度不符 `ErrSizeMismatch`、内容改 `ErrDigestMismatch`，后两者均链 `ErrCorrupt`，互斥可区分 |
 | 损坏/缺失旧口径 | `cas.TestMissingVsCorruptAreDistinct` | 缺失与损坏可区分；损坏 `Put` 不静默覆盖，先删后写可修复 |
 | 全库逐对象校验 | `verify.TestVerifyClassifiesEachKind` | 同一份报告里截断/篡改/缺失逐对象分类，可导出 |
+| 坏/超版本引用巡检 | `verify.TestVerifyCorruptReferenceFails`、`TestVerifyStructurallyInvalidReferenceFails`、`TestVerifyReferenceVersionBoundary` | 读不出来/结构不合法→`corrupt-ref`；超版本→`unsupported-reference-version`；旧格式无版本字段照常 OK；报告不健康、命令失败 |
+| 引用闭包逐位置结论 | `verify.TestVerifyReferenceClosureFindings`、`TestVerifyMalformedClosureIsClassified` | 引用指向缺失/长度不符/内容被改分别 `missing/size-mismatch/digest-mismatch`，带引用名与闭包位置；闭包结构不合法→`malformed` |
+| 坏引用并发不被漏判 | `verify.TestVerifyConcurrentCommitGCAndPersistentCorruptRef` | 提交/回收/巡检并发：持久坏引用每轮必报、健康闭包无假阳性 |
+| 坏引用集成链路 | `integration.TestVerifyFlagsCorruptAndFutureReferences` | 健康引用+坏引用+超版本引用并存：逐条可区分、全库不健康、健康引用不连坐 |
 | 提交原子性 | `commit.TestCommitFailureIsAtomicAndRetriable` | 失败引用不动且原因可分类；修复后重试成功且摘要不变 |
 | 提交缺失/篡改 | `commit.TestCommitMissingBlobClassified` | 缺失 `ErrNotFound`、等长篡改 `ErrDigestMismatch`、`ErrCommitFailed` |
 | 提交门互斥 | `registry.TestCommitGateExcludesGC` | 提交区间内 gc 阻塞；发布后回收闭包对象不丢 |

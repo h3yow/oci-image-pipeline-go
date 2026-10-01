@@ -71,6 +71,22 @@ func (r *Registry) BeginGC() { r.gcMu.Lock() }
 // EndGC 结束一轮回收的互斥区间。
 func (r *Registry) EndGC() { r.gcMu.Unlock() }
 
+// BeginInspect / EndInspect 由只读的整库巡检在整轮扫描前后成对调用。
+//
+// 巡检持 gcMu 的读锁，因此：
+//   - 巡检与提交可并发（同为读锁），但巡检期间引用发布的结构不会被回收
+//     穿插：提交区间同样持读锁，gc.Run 的写锁只能等两者都结束；
+//   - 巡检期间 gc.Run 无法开始，杜绝“巡检刚解析完引用、闭包对象就被
+//     回收删掉”导致巡检对一个仍被引用的闭包误报 missing（假阴性的反面：
+//     对坏引用给出绿色结论）。
+//
+// 与 BeginCommit 不同，巡检不持 mu：纯读引用文件与原子 rename 天然兼容，
+// 读到的要么是旧引用要么是新引用，二者都必然指向完整闭包。
+func (r *Registry) BeginInspect() { r.gcMu.RLock() }
+
+// EndInspect 结束一轮巡检的互斥区间。
+func (r *Registry) EndInspect() { r.gcMu.RUnlock() }
+
 // New 打开 root 下的本地仓库。
 func New(store *cas.Store) (*Registry, error) {
 	root := filepath.Join(store.Root(), "refs")
